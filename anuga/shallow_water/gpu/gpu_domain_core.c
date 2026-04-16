@@ -47,7 +47,9 @@ size_t gpu_estimate_required_memory(anuga_int n, anuga_int nb) {
     //   mesh geometry:         normals(6n), edgelengths(3n), areas(n),
     //                          radii(n), max_speed(n), centroid_coords(2n),
     //                          edge_coords(6n), x/y_centroid_work(2n)     = 23n
-    //   Total doubles: (6 + 15 + 3 + 3 + 23) = 50n doubles
+    //   vertex arrays:         vertex_coordinates(6n),
+    //                          stage/xmom/ymom/bed/height_vertex(5 x 3n)  = 21n
+    //   Total doubles: (6 + 15 + 3 + 3 + 23 + 21) = 71n doubles
     //
     // Per-element int64 arrays:
     //   neighbours(3n), neighbour_edges(3n), surrogate_neighbours(3n),
@@ -57,7 +59,7 @@ size_t gpu_estimate_required_memory(anuga_int n, anuga_int nb) {
     //   — not mapped here but count as we typically allocate them
     //
     // Boundary arrays (small): 5 x nb doubles
-    size_t double_bytes = (size_t)(50) * (size_t)n * sizeof(double);
+    size_t double_bytes = (size_t)(71) * (size_t)n * sizeof(double);
     size_t int_bytes    = (size_t)(11) * (size_t)n * sizeof(int64_t);
     size_t bndry_bytes  = (size_t)(5)  * (size_t)nb * sizeof(double);
     return double_bytes + int_bytes + bndry_bytes;
@@ -198,6 +200,8 @@ int gpu_domain_init(struct gpu_domain *GD, MPI_Comm comm, int rank, int nprocs) 
     // Initialize GPU state
     GD->gpu_initialized = 0;
     GD->backup_arrays_mapped = 0;
+    GD->fixed_ts_printed     = 0;
+    GD->fixed_ts_printed_rk3 = 0;
 
     // Select GPU device (round-robin if more ranks than GPUs)
     int num_devices = omp_get_num_devices();
@@ -422,6 +426,16 @@ int gpu_domain_map_arrays(struct gpu_domain *GD) {
     // tri_full_flag for MPI ghost cell identification
     anuga_int *tri_full_flag = GD->D.tri_full_flag;
 
+    // Vertex arrays: needed for sloped Manning friction, gravity, and
+    // distribute_edges_to_vertices kernels.  Map with NULL guards since
+    // not all domain configurations allocate every vertex array.
+    double *vertex_coords   = GD->D.vertex_coordinates;
+    double *bed_vv          = GD->D.bed_vertex_values;
+    double *stage_vv        = GD->D.stage_vertex_values;
+    double *xmom_vv         = GD->D.xmom_vertex_values;
+    double *ymom_vv         = GD->D.ymom_vertex_values;
+    double *height_vv       = GD->D.height_vertex_values;
+
     // Map all domain arrays to GPU - persistent for entire simulation
     #pragma omp target enter data map(to: \
         stage_cv[0:n], xmom_cv[0:n], ymom_cv[0:n], \
@@ -440,6 +454,27 @@ int gpu_domain_map_arrays(struct gpu_domain *GD) {
     // Map tri_full_flag only when present (parallel domains only)
     if (tri_full_flag != NULL) {
         #pragma omp target enter data map(to: tri_full_flag[0:n])
+    }
+
+    // Map vertex coordinate and vertex value arrays (needed for sloped Manning
+    // friction, gravity, and vertex-based output kernels).
+    if (vertex_coords != NULL) {
+        #pragma omp target enter data map(to: vertex_coords[0:6*n])
+    }
+    if (bed_vv != NULL) {
+        #pragma omp target enter data map(to: bed_vv[0:3*n])
+    }
+    if (stage_vv != NULL) {
+        #pragma omp target enter data map(to: stage_vv[0:3*n])
+    }
+    if (xmom_vv != NULL) {
+        #pragma omp target enter data map(to: xmom_vv[0:3*n])
+    }
+    if (ymom_vv != NULL) {
+        #pragma omp target enter data map(to: ymom_vv[0:3*n])
+    }
+    if (height_vv != NULL) {
+        #pragma omp target enter data map(to: height_vv[0:3*n])
     }
 
     // Map boundary values if present (including bed and height for reflective boundary)
@@ -766,6 +801,14 @@ void gpu_domain_unmap_arrays(struct gpu_domain *GD) {
     // tri_full_flag for MPI ghost cell identification
     anuga_int *tri_full_flag = GD->D.tri_full_flag;
 
+    // Vertex arrays (may be NULL for some configurations)
+    double *vertex_coords = GD->D.vertex_coordinates;
+    double *bed_vv        = GD->D.bed_vertex_values;
+    double *stage_vv      = GD->D.stage_vertex_values;
+    double *xmom_vv       = GD->D.xmom_vertex_values;
+    double *ymom_vv       = GD->D.ymom_vertex_values;
+    double *height_vv     = GD->D.height_vertex_values;
+
     // Unmap domain arrays
     #pragma omp target exit data map(delete: \
         stage_cv[0:n], xmom_cv[0:n], ymom_cv[0:n], \
@@ -784,6 +827,26 @@ void gpu_domain_unmap_arrays(struct gpu_domain *GD) {
     // Unmap tri_full_flag only when it was mapped (parallel domains only)
     if (tri_full_flag != NULL) {
         #pragma omp target exit data map(delete: tri_full_flag[0:n])
+    }
+
+    // Unmap vertex arrays (only those that were mapped)
+    if (vertex_coords != NULL) {
+        #pragma omp target exit data map(delete: vertex_coords[0:6*n])
+    }
+    if (bed_vv != NULL) {
+        #pragma omp target exit data map(delete: bed_vv[0:3*n])
+    }
+    if (stage_vv != NULL) {
+        #pragma omp target exit data map(delete: stage_vv[0:3*n])
+    }
+    if (xmom_vv != NULL) {
+        #pragma omp target exit data map(delete: xmom_vv[0:3*n])
+    }
+    if (ymom_vv != NULL) {
+        #pragma omp target exit data map(delete: ymom_vv[0:3*n])
+    }
+    if (height_vv != NULL) {
+        #pragma omp target exit data map(delete: height_vv[0:3*n])
     }
 
     if (nb > 0) {

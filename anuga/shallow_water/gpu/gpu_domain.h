@@ -365,6 +365,12 @@ struct gpu_domain {
     // These may already exist in base domain, but we track GPU copies here
     int backup_arrays_mapped;
 
+    // Fixed-timestep print flags: avoids duplicate console messages.
+    // Stored here instead of as function-local statics so multiple gpu_domain
+    // instances (e.g. future multi-domain GPU setup) do not share state.
+    int fixed_ts_printed;        // RK2 path
+    int fixed_ts_printed_rk3;   // RK3 path
+
     // FLOP counters for performance profiling (Gordon Bell)
     struct flop_counters flops;
 };

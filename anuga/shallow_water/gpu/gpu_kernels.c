@@ -81,23 +81,14 @@ void gpu_backup_conserved_quantities(struct gpu_domain *GD) {
 
 void gpu_saxpy_conserved_quantities(struct gpu_domain *GD, double a, double b) {
     NVTX_PUSH("gpu_saxpy_conserved_quantities");
-    // Delegate to core kernel (c=0.0 means "skip division", used for RK2)
+    // Delegate to core kernel (c=0.0 means "skip division", used for RK2).
+    // core_saxpy_conserved_quantities now fuses the height update inline,
+    // so no separate height-recompute pass is needed here.
     core_saxpy_conserved_quantities(&GD->D, a, b, 0.0);
-
-    // Also update height to match the new stage (needed for volume calculation)
-    anuga_int n = GD->D.number_of_elements;
-    double * restrict stage_cv = GD->D.stage_centroid_values;
-    double * restrict height_cv = GD->D.height_centroid_values;
-    double * restrict bed_cv = GD->D.bed_centroid_values;
-
-    OMP_PARALLEL_LOOP
-    for (anuga_int k = 0; k < n; k++) {
-        height_cv[k] = fmax(stage_cv[k] - bed_cv[k], 0.0);
-    }
 
     // Count FLOPs: 9 FLOPs per element (3 quantities × (2 mul + 1 add) + height calc)
     if (GD->flops.enabled) {
-        GD->flops.saxpy_flops += (uint64_t)n * FLOPS_SAXPY;
+        GD->flops.saxpy_flops += (uint64_t)GD->D.number_of_elements * FLOPS_SAXPY;
         GD->flops.saxpy_calls++;
     }
     NVTX_POP();
@@ -107,22 +98,13 @@ void gpu_saxpy3_conserved_quantities(struct gpu_domain *GD, double a, double b, 
     NVTX_PUSH("gpu_saxpy3_conserved_quantities");
     // Divide-by-c variant used for the final RK3 combination:
     //   Q = (a*Q_current + b*Q_backup) / c
-    // Calling core with c != 0 and c != 1 triggers the division pass.
+    // core_saxpy_conserved_quantities now fuses the c-scaling and height
+    // update into a single kernel pass, eliminating the previous separate
+    // scaling loop and height-recompute loop.
     core_saxpy_conserved_quantities(&GD->D, a, b, c);
 
-    // Update height to match the new stage values
-    anuga_int n = GD->D.number_of_elements;
-    double * restrict stage_cv = GD->D.stage_centroid_values;
-    double * restrict height_cv = GD->D.height_centroid_values;
-    double * restrict bed_cv = GD->D.bed_centroid_values;
-
-    OMP_PARALLEL_LOOP
-    for (anuga_int k = 0; k < n; k++) {
-        height_cv[k] = fmax(stage_cv[k] - bed_cv[k], 0.0);
-    }
-
     if (GD->flops.enabled) {
-        GD->flops.saxpy_flops += (uint64_t)n * FLOPS_SAXPY;
+        GD->flops.saxpy_flops += (uint64_t)GD->D.number_of_elements * FLOPS_SAXPY;
         GD->flops.saxpy_calls++;
     }
     NVTX_POP();
@@ -130,19 +112,10 @@ void gpu_saxpy3_conserved_quantities(struct gpu_domain *GD, double a, double b, 
 
 double gpu_protect(struct gpu_domain *GD) {
     NVTX_PUSH("gpu_protect");
-    // Delegate to core kernel
+    // Delegate to core kernel.
+    // core_protect now fuses the height update inline, so no separate
+    // height-recompute pass is needed here.
     double mass_error = core_protect(&GD->D);
-
-    // Also update height quantity (core_protect doesn't do this)
-    anuga_int n = GD->D.number_of_elements;
-    double * restrict stage_cv = GD->D.stage_centroid_values;
-    double * restrict bed_cv = GD->D.bed_centroid_values;
-    double * restrict height_cv = GD->D.height_centroid_values;
-
-    OMP_PARALLEL_LOOP
-    for (anuga_int k = 0; k < n; k++) {
-        height_cv[k] = fmax(stage_cv[k] - bed_cv[k], 0.0);
-    }
 
     // Count FLOPs: 5 FLOPs per element (depth check, mass error)
     if (GD->flops.enabled) {
@@ -237,13 +210,12 @@ double gpu_evolve_one_rk2_step(struct gpu_domain *GD, double max_timestep, int a
     local_timestep = gpu_compute_fluxes(GD);
 
     // Compute global timestep
-    static int fixed_ts_printed = 0;
     if (GD->fixed_flux_timestep > 0.0) {
         // Fixed timestep - skip MPI allreduce entirely
-        if (GD->rank == 0 && !fixed_ts_printed) {
+        if (GD->rank == 0 && !GD->fixed_ts_printed) {
             printf("Using a fixed timestep! (dt = %e)\n", GD->fixed_flux_timestep);
             fflush(stdout);
-            fixed_ts_printed = 1;
+            GD->fixed_ts_printed = 1;
         }
         timestep = GD->fixed_flux_timestep;
         if (timestep > max_timestep) {
@@ -349,12 +321,11 @@ double gpu_evolve_one_rk3_step(struct gpu_domain *GD, double max_timestep, int a
     local_timestep = gpu_compute_fluxes(GD);
 
     // Determine global timestep (same logic as RK2)
-    static int fixed_ts_printed_rk3 = 0;
     if (GD->fixed_flux_timestep > 0.0) {
-        if (GD->rank == 0 && !fixed_ts_printed_rk3) {
+        if (GD->rank == 0 && !GD->fixed_ts_printed_rk3) {
             printf("RK3: Using a fixed timestep! (dt = %e)\n", GD->fixed_flux_timestep);
             fflush(stdout);
-            fixed_ts_printed_rk3 = 1;
+            GD->fixed_ts_printed_rk3 = 1;
         }
         timestep = GD->fixed_flux_timestep;
         if (timestep > max_timestep) timestep = max_timestep;

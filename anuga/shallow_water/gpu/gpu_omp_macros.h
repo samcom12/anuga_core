@@ -44,15 +44,21 @@
 // GPU MODE - OpenMP target offloading
 // ============================================================================
 
-// Parallel loops on device
-#define OMP_PARALLEL_LOOP _Pragma("omp target teams loop")
-#define OMP_PARALLEL_LOOP_SIMD _Pragma("omp target teams loop")
+// Parallel loops on device.
+// Use 'distribute parallel for simd' instead of 'teams loop' to explicitly
+// distribute iterations across teams and enable SIMD vectorisation within
+// each thread block, giving compilers (NVHPC, Clang offload) better control
+// over team/thread occupancy.
+#define OMP_PARALLEL_LOOP _Pragma("omp target teams distribute parallel for simd")
+#define OMP_PARALLEL_LOOP_SIMD _Pragma("omp target teams distribute parallel for simd")
 
-// Reductions on device - use DO_PRAGMA to allow variable name expansion
-// Note: Using distribute parallel for for better reduction support
+// Reductions on device - use DO_PRAGMA to allow variable name expansion.
+// All three variants now use 'distribute parallel for' for consistency and
+// correct multi-team reduction behaviour (OMP_PARALLEL_LOOP_REDUCTION_MIN
+// previously used the weaker 'teams loop' form).
 #define OMP_PARALLEL_LOOP_REDUCTION_PLUS(var) DO_PRAGMA(omp target teams distribute parallel for reduction(+:var))
-#define OMP_PARALLEL_LOOP_REDUCTION_MIN(var) DO_PRAGMA(omp target teams loop reduction(min:var))
-#define OMP_PARALLEL_LOOP_REDUCTION_MAX(var) DO_PRAGMA(omp target teams distribute parallel for reduction(max:var))
+#define OMP_PARALLEL_LOOP_REDUCTION_MIN(var)  DO_PRAGMA(omp target teams distribute parallel for reduction(min:var))
+#define OMP_PARALLEL_LOOP_REDUCTION_MAX(var)  DO_PRAGMA(omp target teams distribute parallel for reduction(max:var))
 
 // Data mapping to device
 // Note: These need to be used with care - the actual map clause arguments
