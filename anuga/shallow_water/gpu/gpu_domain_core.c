@@ -374,10 +374,10 @@ int gpu_domain_map_arrays(struct gpu_domain *GD) {
     if (GD->gpu_initialized) return 1;
 
     // On pure CPU runs (no GPU device available), skip all device data mapping.
-    // The OMP_PARALLEL_LOOP target kernels will execute on the host device
-    // automatically.  Attempting #pragma omp target enter data without a real
-    // device causes a runtime error in most OpenMP runtimes unless
-    // OMP_TARGET_OFFLOAD=disabled is set explicitly.
+    // #pragma omp target regions will execute on the host device automatically.
+    // Attempting #pragma omp target enter data without a real device causes a
+    // runtime error in most OpenMP runtimes unless OMP_TARGET_OFFLOAD=disabled
+    // is set explicitly.
     if (GD->device_id < 0) {
         GD->gpu_initialized = 1;
         if (GD->rank == 0 && GD->verbose) {
@@ -1180,16 +1180,16 @@ int gpu_boundary_edge_sync_init(struct gpu_domain *GD,
     S->height_buf = (double*)malloc(S->buf_size * sizeof(double));
 
     // Map all buffers to GPU once -- skip on CPU-only runs (no device)
-    int nc = num_boundary_cells;
-    int bs = S->buf_size;
-    int *cell_ids_ptr = S->cell_ids;
-    double *stage_buf = S->stage_buf;
-    double *xmom_buf = S->xmom_buf;
-    double *ymom_buf = S->ymom_buf;
-    double *bed_buf = S->bed_buf;
-    double *height_buf = S->height_buf;
-
     if (GD->device_id >= 0) {
+        int nc = num_boundary_cells;
+        int bs = S->buf_size;
+        int *cell_ids_ptr = S->cell_ids;
+        double *stage_buf = S->stage_buf;
+        double *xmom_buf = S->xmom_buf;
+        double *ymom_buf = S->ymom_buf;
+        double *bed_buf = S->bed_buf;
+        double *height_buf = S->height_buf;
+
         #pragma omp target enter data map(to: cell_ids_ptr[0:nc]) \
             map(alloc: stage_buf[0:bs], xmom_buf[0:bs], ymom_buf[0:bs], \
                        bed_buf[0:bs], height_buf[0:bs])
