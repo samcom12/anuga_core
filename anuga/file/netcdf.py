@@ -38,13 +38,17 @@ def NetCDFFile(file_name, netcdf_mode=netcdf_mode_r, nc_format=None):
         number_of_timesteps = fid.dimensions['number_of_timesteps']
         number_of_points = fid.dimensions['number_of_points']
 
-    nc_format controls the NetCDF format used when creating new files ('w' mode):
-        None or 'NETCDF3_64BIT' (default) - classic format, broad compatibility
-        'NETCDF4' - enables zlib variable compression and large files (HDF5 backend)
-        'NETCDF4_CLASSIC' - NETCDF4 backend with classic data model
+    nc_format controls the on-disk format used when creating new files
+    (netcdf_mode starting with 'w').  For read ('r') and append ('a') modes
+    nc_format is ignored and the format is determined by the existing file:
 
-    For read ('r') and append ('a') modes nc_format is ignored; the format is
-    determined by the existing file.
+        nc_format=None (default) - creates a 'NETCDF3_64BIT' file for maximum
+            compatibility with downstream tools that only support classic NetCDF.
+        nc_format='NETCDF4' - creates an HDF5-backed NETCDF4 file that supports
+            per-variable zlib compression (pass zlib=True, complevel=N to
+            createVariable) and files larger than 2 GB.
+        nc_format='NETCDF4_CLASSIC' - NETCDF4 HDF5 backend with the classic
+            data model (no groups, unlimited dimensions only in first position).
     """
 
     using_scientific = using_netcdf4 = False

@@ -2583,8 +2583,8 @@ class Domain(Generic_Domain):
 
         # Ensure any pending async SWW write finishes before returning.
         if self.store and hasattr(self, 'writer') and self.writer is not None:
-            if hasattr(self.writer, 'wait_for_pending_write'):
-                self.writer.wait_for_pending_write()
+            if hasattr(self.writer, 'close'):
+                self.writer.close()
 
 
     def initialise_storage(self):

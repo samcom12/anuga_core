@@ -283,11 +283,17 @@ class SWW_file(Data_format):
         """
 
         # Wait for any previously submitted async write to complete before
-        # collecting new data.  This ensures we never have more than one
-        # pending write and that errors surface promptly.
+        # collecting new data.  Any exception raised by the background write
+        # is re-raised here at the next timestep so it is visible to the caller.
         if self.async_write and self._pending_future is not None:
-            self._pending_future.result()
-            self._pending_future = None
+            try:
+                self._pending_future.result()
+            except Exception as exc:
+                raise RuntimeError(
+                    'Async SWW write failed for file %s: %s' % (self.filename, exc)
+                ) from exc
+            finally:
+                self._pending_future = None
 
         # Collect all data needed for this timestep synchronously so that
         # the domain can safely advance before the file write completes.
@@ -382,6 +388,8 @@ class SWW_file(Data_format):
         dynamic_quantities = {}
         for name in self.writer.dynamic_quantities:
             Q = domain.quantities[name]
+            # get_vertex_values returns a newly allocated array, so no explicit
+            # copy is needed here for thread safety.
             A, _ = Q.get_vertex_values(xy=False, precision=self.precision)
             if storable_indices is not None:
                 if name == 'stage':
@@ -389,7 +397,7 @@ class SWW_file(Data_format):
                 if name in ['xmomentum', 'ymomentum']:
                     null = num.zeros(num.size(A), A.dtype.char)
                     A = num.choose(storable_indices, (null, A))
-            dynamic_quantities[name] = A  # already a new array from get_vertex_values
+            dynamic_quantities[name] = A
 
         dynamic_quantities_centroid = {}
         for name in self.writer.dynamic_c_quantities:
@@ -403,7 +411,7 @@ class SWW_file(Data_format):
         extrema_snapshot = None
         if domain.quantities_to_be_monitored is not None:
             extrema_snapshot = {}
-            for q, info in list(domain.quantities_to_be_monitored.items()):
+            for q, info in domain.quantities_to_be_monitored.items():
                 extrema_snapshot[q] = {
                     'min': info['min'],
                     'min_location': (info['min_location'].copy()
@@ -483,22 +491,42 @@ class SWW_file(Data_format):
         fid.close()
 
     def wait_for_pending_write(self):
-        """Block until any background write submitted by the async path completes."""
+        """Block until any background write submitted by the async path completes.
+
+        Raises RuntimeError if the background write encountered an exception,
+        so the caller is notified of any IO failure.
+        """
 
         if self._pending_future is not None:
-            self._pending_future.result()
-            self._pending_future = None
+            try:
+                self._pending_future.result()
+            except Exception as exc:
+                raise RuntimeError(
+                    'Async SWW write failed for file %s: %s' % (self.filename, exc)
+                ) from exc
+            finally:
+                self._pending_future = None
+
+    def close(self):
+        """Flush any pending async write and shut down the background executor.
+
+        Call this explicitly after the last ``store_timestep`` to guarantee
+        all data is written to disk before continuing.  This is also called
+        automatically from ``__del__``, but explicit calls are preferred.
+        """
+
+        self.wait_for_pending_write()
+        if self._write_executor is not None:
+            self._write_executor.shutdown(wait=True)
+            self._write_executor = None
 
     def __del__(self):
         """Ensure any pending async write finishes before the object is garbage-collected."""
 
         try:
-            self.wait_for_pending_write()
-        except Exception:
-            pass
-        if self._write_executor is not None:
-            self._write_executor.shutdown(wait=True)
-            self._write_executor = None
+            self.close()
+        except Exception as exc:
+            log.info('SWW_file.__del__: error during async write cleanup: %s' % exc)
 
 
 class Read_sww:
