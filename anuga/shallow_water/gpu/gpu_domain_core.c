@@ -387,6 +387,12 @@ int gpu_domain_map_arrays(struct gpu_domain *GD) {
         return 1;
     }
 
+    // Ensure the OpenMP default device is set to this rank's assigned GPU before
+    // any #pragma omp target enter data directives.  omp_set_default_device is
+    // per-thread (or per-process in some runtimes), and may have been reset to 0
+    // by the Python runtime or other C code between gpu_domain_init and here.
+    omp_set_default_device(GD->device_id);
+
     // Check device memory before attempting any mapping.
     // Returns 0 and prints a clear error if there isn't enough free memory.
     if (!gpu_check_device_memory(GD)) {
@@ -701,6 +707,10 @@ void gpu_remap_boundary_arrays(struct gpu_domain *GD) {
         return;
     }
 
+    // Ensure the OpenMP default device is correct for this rank before any
+    // #pragma omp target enter data directives.
+    omp_set_default_device(GD->device_id);
+
     // Map reflective boundary arrays if initialized but not yet mapped
     struct reflective_boundary *R = &GD->reflective;
     if (R->num_edges > 0 && R->boundary_indices != NULL && !R->mapped) {
@@ -796,6 +806,10 @@ void gpu_domain_unmap_arrays(struct gpu_domain *GD) {
         GD->gpu_initialized = 0;
         return;
     }
+
+    // Ensure the OpenMP default device matches this rank's GPU so that
+    // #pragma omp target exit data frees memory from the correct device.
+    omp_set_default_device(GD->device_id);
 
     anuga_int n = GD->D.number_of_elements;
     anuga_int nb = GD->D.boundary_length;
@@ -1027,6 +1041,7 @@ void gpu_domain_sync_to_device(struct gpu_domain *GD) {
     // Sync all centroid values to GPU (use at start of GPU computation)
     if (!GD->gpu_initialized) return;
     if (GD->device_id < 0) return;  // No device -- data already on host
+    omp_set_default_device(GD->device_id);
 
     anuga_int n = GD->D.number_of_elements;
     double *stage_cv = GD->D.stage_centroid_values;
@@ -1041,6 +1056,7 @@ void gpu_domain_sync_from_device(struct gpu_domain *GD) {
     // Sync centroid values from GPU (use at yieldstep for Python I/O)
     if (!GD->gpu_initialized) return;
     if (GD->device_id < 0) return;  // No device -- data already on host
+    omp_set_default_device(GD->device_id);
 
     anuga_int n = GD->D.number_of_elements;
     double *stage_cv = GD->D.stage_centroid_values;
@@ -1055,6 +1071,7 @@ void gpu_domain_sync_all_from_device(struct gpu_domain *GD) {
     // Sync ALL arrays from GPU (for debugging/testing intermediate values)
     if (!GD->gpu_initialized) return;
     if (GD->device_id < 0) return;  // No device -- data already on host
+    omp_set_default_device(GD->device_id);
 
     anuga_int n = GD->D.number_of_elements;
     anuga_int nb = GD->D.boundary_length;
@@ -1116,6 +1133,7 @@ void gpu_sync_boundary_values(struct gpu_domain *GD) {
     // Sync boundary values TO GPU (after CPU boundary evaluation)
     if (!GD->gpu_initialized) return;
     if (GD->device_id < 0) return;  // No device -- data already on host
+    omp_set_default_device(GD->device_id);
 
     anuga_int nb = GD->D.boundary_length;
     if (nb == 0) return;
@@ -1134,6 +1152,7 @@ void gpu_sync_edge_values_from_device(struct gpu_domain *GD) {
     // Sync ALL edge values FROM GPU - expensive, use sparse version if possible
     if (!GD->gpu_initialized) return;
     if (GD->device_id < 0) return;  // No device -- data already on host
+    omp_set_default_device(GD->device_id);
 
     anuga_int n = GD->D.number_of_elements;
 
@@ -1181,6 +1200,7 @@ int gpu_boundary_edge_sync_init(struct gpu_domain *GD,
 
     // Map all buffers to GPU once -- skip on CPU-only runs (no device)
     if (GD->device_id >= 0) {
+        omp_set_default_device(GD->device_id);
         int nc = num_boundary_cells;
         int bs = S->buf_size;
         int *cell_ids_ptr = S->cell_ids;
@@ -1214,6 +1234,7 @@ void gpu_boundary_edge_sync_finalize(struct gpu_domain *GD) {
     if (S->num_boundary_cells > 0) {
         // Unmap from GPU (only if arrays were mapped to a device)
         if (GD->device_id >= 0) {
+            omp_set_default_device(GD->device_id);
             int nc = S->num_boundary_cells;
             int bs = S->buf_size;
             int *cell_ids_ptr = S->cell_ids;
@@ -1253,6 +1274,10 @@ void gpu_boundary_edge_sync(struct gpu_domain *GD) {
     struct boundary_edge_sync *S = &GD->edge_sync;
 
     if (!S->initialized || S->num_boundary_cells == 0) return;
+
+    if (GD->device_id >= 0) {
+        omp_set_default_device(GD->device_id);
+    }
 
     int nc = S->num_boundary_cells;
     int bs = S->buf_size;
