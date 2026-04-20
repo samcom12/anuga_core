@@ -3,6 +3,8 @@
 
 import numpy
 import numpy as num
+import threading
+import concurrent.futures
 from anuga.utilities.file_utils import create_filename
 from anuga.coordinate_transforms.geo_reference import \
     ensure_geo_reference
@@ -109,6 +111,18 @@ class SWW_file(Data_format):
         else:
             self.timezone = 'UTC'
 
+        # zlib compression for dynamic variables (requires NETCDF4 format)
+        self.zlib_compression = bool(getattr(domain, 'sww_zlib_compression', False))
+        self.zlib_complevel = int(getattr(domain, 'sww_zlib_complevel', 4))
+        self._nc_format = 'NETCDF4' if self.zlib_compression else None
+
+        # Async write: collect data synchronously, write in background thread
+        self.async_write = bool(getattr(domain, 'sww_async_write', False))
+        self._write_executor = None
+        self._pending_future = None
+        if self.async_write:
+            self._write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
 
         # Call parent constructor
         Data_format.__init__(self, domain, 'sww', mode)
@@ -138,7 +152,7 @@ class SWW_file(Data_format):
                     dynamic_c_quantities.append(q+'_c')
 
         # NetCDF file definition
-        fid = NetCDFFile(self.filename, mode)
+        fid = NetCDFFile(self.filename, mode, nc_format=self._nc_format)
         if mode[0] == 'w':
             description = 'Output from anuga.file.sww ' \
                           'suitable for plotting'
@@ -157,7 +171,9 @@ class SWW_file(Data_format):
                                      smoothing=domain.smooth,
                                      order=domain.default_order,
                                      sww_precision=self.precision,
-                                     timezone=self.timezone)
+                                     timezone=self.timezone,
+                                     zlib=self.zlib_compression,
+                                     complevel=self.zlib_complevel)
 
             # Extra optional information
             if hasattr(domain, 'texture'):
@@ -258,23 +274,53 @@ class SWW_file(Data_format):
         fid.close()
 
     def store_timestep(self):
-        """Store time and time dependent quantities
+        """Store time and time dependent quantities.
+
+        When ``async_write`` is enabled (set via ``domain.sww_async_write =
+        True``), quantity data is collected synchronously from the domain and
+        then written to the NetCDF file in a background thread, allowing the
+        simulation to continue computing while the IO is in progress.
         """
 
-        #import types
+        # Wait for any previously submitted async write to complete before
+        # collecting new data.  This ensures we never have more than one
+        # pending write and that errors surface promptly.
+        if self.async_write and self._pending_future is not None:
+            self._pending_future.result()
+            self._pending_future = None
+
+        # Collect all data needed for this timestep synchronously so that
+        # the domain can safely advance before the file write completes.
+        snapshot = self._collect_timestep_snapshot()
+        if snapshot is None:
+            # Recursion case already handled inside _collect_timestep_snapshot
+            return
+
+        if self.async_write:
+            self._pending_future = self._write_executor.submit(
+                self._write_timestep_snapshot, snapshot)
+        else:
+            self._write_timestep_snapshot(snapshot)
+
+    def _collect_timestep_snapshot(self):
+        """Collect a snapshot of all data required for the current timestep.
+
+        Returns a dict ready to pass to ``_write_timestep_snapshot``, or
+        ``None`` if the file-size recursion path was taken (which writes
+        synchronously internally and needs no further action).
+        """
+
         from time import sleep
         from os import stat
 
-        # Get NetCDF
+        # Open the file to check size and read the current time length.
         retries = 0
         file_open = False
+        fid = None
         while not file_open and retries < 10:
             try:
-                # Open existing file
                 fid = NetCDFFile(self.filename, netcdf_mode_a)
             except OSError:
-                # This could happen if someone was reading the file.
-                # In that case, wait a while and try again
                 msg = 'Warning (store_timestep): File %s could not be opened' \
                       % self.filename
                 msg += ' - trying step %s again' % self.domain.relative_time
@@ -289,148 +335,170 @@ class SWW_file(Data_format):
             raise DataFileNotOpenError(msg)
 
         # Check to see if the file is already too big:
-        time = fid.variables['time'][:]
-
-        i = len(time) + 1
+        time_arr = fid.variables['time'][:]
+        i = len(time_arr) + 1
         file_size = stat(self.filename)[6]
-        file_size_increase = file_size//i
-        if file_size + file_size_increase > self.max_size * 2**self.recursion:
-            # In order to get the file name and start time correct,
-            # I change the domain.filename and domain.starttime.
-            # This is the only way to do this without changing
-            # other modules (I think).
+        file_size_increase = file_size // i
+        fid.close()
 
-            # Write a filename addon that won't break the anuga viewers
-            # (10.sww is bad)
+        if file_size + file_size_increase > self.max_size * 2**self.recursion:
+            # File too large — create a new SWW file synchronously (rare path).
             filename_ext = '_time_%s' % self.domain.relative_time
             filename_ext = filename_ext.replace('.', '_')
-
-            # Remember the old filename, then give domain a
-            # name with the extension
             old_domain_filename = self.domain.get_name()
             if not self.recursion:
                 self.domain.set_name(old_domain_filename + filename_ext)
-
-            # Temporarily change the domain starttime to the current time
             old_domain_starttime = self.domain.starttime
             self.domain.starttime = self.domain.get_time()
-
-            # Build a new data_structure.
             next_data_structure = SWW_file(self.domain, mode=self.mode,
                                            max_size=self.max_size,
-                                           recursion=self.recursion+1)
+                                           recursion=self.recursion + 1)
             if not self.recursion:
                 log.info('    file_size = %s' % file_size)
                 log.info('    saving file to %s'
-                             % next_data_structure.filename)
-
-            # Set up the new data_structure
+                         % next_data_structure.filename)
             self.domain.writer = next_data_structure
-
-            # Store connectivity and first timestep
             next_data_structure.store_connectivity()
             next_data_structure.store_timestep()
-            fid.sync()
-            fid.close()
-
-            # Restore the old starttime and filename
+            # Restore
             self.domain.starttime = old_domain_starttime
             self.domain.set_name(old_domain_filename)
-        else:
-            self.recursion = False
-            domain = self.domain
+            return None  # Handled; caller should not write further.
 
-            # Get the variables
-            time = fid.variables['time'][:]
-            i = len(time)
+        # Normal path: collect all data from the domain now (synchronously).
+        self.recursion = False
+        domain = self.domain
+        relative_time = domain.relative_time
 
-            if 'stage' in self.writer.dynamic_quantities:
-                # Select only those values for stage,
-                # xmomentum and ymomentum (if stored) where
-                # depth exceeds minimum_storable_height
-                #
-                # In this branch it is assumed that elevation
-                # is also available as a quantity
+        z = None
+        storable_indices = None
+        if 'stage' in self.writer.dynamic_quantities:
+            Q = domain.quantities['stage']
+            w, _ = Q.get_vertex_values(xy=False)
+            Q = domain.quantities['elevation']
+            z, _ = Q.get_vertex_values(xy=False)
+            storable_indices = num.array(w - z >= self.minimum_storable_height)
 
-                # Smoothing for the get_vertex_values will be obtained
-                # from the smooth setting in domain
+        dynamic_quantities = {}
+        for name in self.writer.dynamic_quantities:
+            Q = domain.quantities[name]
+            A, _ = Q.get_vertex_values(xy=False, precision=self.precision)
+            if storable_indices is not None:
+                if name == 'stage':
+                    A = num.choose(storable_indices, (z, A))
+                if name in ['xmomentum', 'ymomentum']:
+                    null = num.zeros(num.size(A), A.dtype.char)
+                    A = num.choose(storable_indices, (null, A))
+            dynamic_quantities[name] = A  # already a new array from get_vertex_values
 
-                Q = domain.quantities['stage']
-                w, _ = Q.get_vertex_values(xy=False)
+        dynamic_quantities_centroid = {}
+        for name in self.writer.dynamic_c_quantities:
+            Q = domain.quantities[name[:-2]]
+            # centroid_values is a live array — take a copy so the background
+            # thread sees the values at *this* timestep even after the domain
+            # advances.
+            dynamic_quantities_centroid[name] = Q.centroid_values.copy()
 
-                Q = domain.quantities['elevation']
-                z, _ = Q.get_vertex_values(xy=False)
+        # Snapshot the extrema (monitored quantities) if needed.
+        extrema_snapshot = None
+        if domain.quantities_to_be_monitored is not None:
+            extrema_snapshot = {}
+            for q, info in list(domain.quantities_to_be_monitored.items()):
+                extrema_snapshot[q] = {
+                    'min': info['min'],
+                    'min_location': (info['min_location'].copy()
+                                     if info['min_location'] is not None else None),
+                    'min_time': info['min_time'],
+                    'max': info['max'],
+                    'max_location': (info['max_location'].copy()
+                                     if info['max_location'] is not None else None),
+                    'max_time': info['max_time'],
+                }
 
-                storable_indices = num.array(
-                    w-z >= self.minimum_storable_height)
+        return {
+            'filename': self.filename,
+            'relative_time': relative_time,
+            'precision': self.precision,
+            'dynamic_quantities': dynamic_quantities,
+            'dynamic_quantities_centroid': dynamic_quantities_centroid,
+            'store_centroids': self.store_centroids,
+            'extrema_snapshot': extrema_snapshot,
+            'writer': self.writer,
+        }
 
-                # print numpy.sum(storable_indices), len(z), self.minimum_storable_height, numpy.min(w-z)
+    def _write_timestep_snapshot(self, snapshot):
+        """Write a previously collected snapshot to the NetCDF file.
+
+        This method is safe to call from a background thread because it only
+        uses data already captured in *snapshot* — it does not touch the domain.
+        """
+
+        from time import sleep
+
+        filename = snapshot['filename']
+        retries = 0
+        file_open = False
+        fid = None
+        while not file_open and retries < 10:
+            try:
+                fid = NetCDFFile(filename, netcdf_mode_a)
+            except OSError:
+                msg = 'Warning (_write_timestep_snapshot): File %s could not be opened' \
+                      % filename
+                log.info(msg)
+                retries += 1
+                sleep(1)
             else:
-                # Very unlikely branch
-                storable_indices = None  # This means take all
+                file_open = True
 
-            # Now store dynamic quantities
-            dynamic_quantities = {}
-            dynamic_quantities_centroid = {}
+        if not file_open:
+            raise DataFileNotOpenError(
+                'File %s could not be opened for append' % filename)
 
-            for name in self.writer.dynamic_quantities:
-                #netcdf_array = fid.variables[name]
+        writer = snapshot['writer']
+        slice_index = writer.store_quantities(
+            fid,
+            time=snapshot['relative_time'],
+            sww_precision=snapshot['precision'],
+            **snapshot['dynamic_quantities'])
 
-                Q = domain.quantities[name]
-                A, _ = Q.get_vertex_values(xy=False,
-                                           precision=self.precision)
+        if snapshot['store_centroids']:
+            writer.store_quantities_centroid(
+                fid,
+                slice_index=slice_index,
+                sww_precision=snapshot['precision'],
+                **snapshot['dynamic_quantities_centroid'])
 
-                if storable_indices is not None:
-                    if name == 'stage':
-                        A = num.choose(storable_indices, (z, A))
+        if snapshot['extrema_snapshot'] is not None:
+            for q, info in snapshot['extrema_snapshot'].items():
+                if info['min'] is not None:
+                    fid.variables[q + '.extrema'][0] = info['min']
+                    fid.variables[q + '.min_location'][:] = info['min_location']
+                    fid.variables[q + '.min_time'][0] = info['min_time']
+                if info['max'] is not None:
+                    fid.variables[q + '.extrema'][1] = info['max']
+                    fid.variables[q + '.max_location'][:] = info['max_location']
+                    fid.variables[q + '.max_time'][0] = info['max_time']
 
-                    if name in ['xmomentum', 'ymomentum']:
-                        # Get xmomentum where depth exceeds
-                        # minimum_storable_height
+        fid.close()
 
-                        # Define a zero vector of same size and type as A
-                        # for use with momenta
-                        null = num.zeros(num.size(A), A.dtype.char)
-                        A = num.choose(storable_indices, (null, A))
+    def wait_for_pending_write(self):
+        """Block until any background write submitted by the async path completes."""
 
-                dynamic_quantities[name] = A
+        if self._pending_future is not None:
+            self._pending_future.result()
+            self._pending_future = None
 
-            for name in self.writer.dynamic_c_quantities:
-                Q = domain.quantities[name[:-2]]
-                dynamic_quantities_centroid[name] = Q.centroid_values
+    def __del__(self):
+        """Ensure any pending async write finishes before the object is garbage-collected."""
 
-            # Store dynamic quantities
-            slice_index = self.writer.store_quantities(fid,
-                                                       time=self.domain.relative_time,
-                                                       sww_precision=self.precision,
-                                                       **dynamic_quantities)
-
-            # Store dynamic quantities
-            if self.store_centroids:
-                self.writer.store_quantities_centroid(fid,
-                                                      slice_index=slice_index,
-                                                      sww_precision=self.precision,
-                                                      **dynamic_quantities_centroid)
-
-            # Update extrema if requested
-            domain = self.domain
-            if domain.quantities_to_be_monitored is not None:
-                for q, info in list(domain.quantities_to_be_monitored.items()):
-                    if info['min'] is not None:
-                        fid.variables[q + '.extrema'][0] = info['min']
-                        fid.variables[q + '.min_location'][:] = \
-                            info['min_location']
-                        fid.variables[q + '.min_time'][0] = info['min_time']
-
-                    if info['max'] is not None:
-                        fid.variables[q + '.extrema'][1] = info['max']
-                        fid.variables[q + '.max_location'][:] = \
-                            info['max_location']
-                        fid.variables[q + '.max_time'][0] = info['max_time']
-
-            # Flush and close
-            # fid.sync()
-            fid.close()
+        try:
+            self.wait_for_pending_write()
+        except Exception:
+            pass
+        if self._write_executor is not None:
+            self._write_executor.shutdown(wait=True)
+            self._write_executor = None
 
 
 class Read_sww:
@@ -571,7 +639,9 @@ class Write_sww(Write_sts):
                      order=1,
                      sww_precision=netcdf_float32,
                      timezone='UTC',
-                     verbose=False):
+                     verbose=False,
+                     zlib=False,
+                     complevel=4):
         """Write an SWW file header.
 
         Writes the first section of the .sww file.
@@ -581,6 +651,8 @@ class Write_sww(Write_sts):
         Note, if a list is given the info will be made relative.
         number_of_volumes - the number of triangles
         number_of_points - the number of vertices in the mesh
+        zlib - if True, enable zlib compression on dynamic variables (requires NETCDF4 format)
+        complevel - zlib compression level 1-9 (default 4)
         """
 
         from anuga import get_revision_number
@@ -687,7 +759,8 @@ class Write_sww(Write_sts):
             outfile.createVariable(q, sww_precision,
                                    ('number_of_volumes',))
 
-        self.write_dynamic_quantities(outfile, times, precis=sww_precision)
+        self.write_dynamic_quantities(outfile, times, precis=sww_precision,
+                                      zlib=zlib, complevel=complevel)
 
         outfile.sync()
 
@@ -796,14 +869,23 @@ class Write_sww(Write_sts):
         outfile.variables['volumes'][:] = volumes
 
     def write_dynamic_quantities(self, outfile,
-                                 times, precis=netcdf_float32, verbose=False):
+                                 times, precis=netcdf_float32, verbose=False,
+                                 zlib=False, complevel=4):
         """
             Write out given quantities to file.
+
+            zlib - if True apply zlib compression (requires NETCDF4 file format)
+            complevel - compression level 1-9 (default 4, moderate compression/speed)
         """
+
+        compress_kwargs = {}
+        if zlib:
+            compress_kwargs = {'zlib': True, 'complevel': complevel}
 
         for q in self.dynamic_quantities:
             outfile.createVariable(q, precis, ('number_of_timesteps',
-                                               'number_of_points'))
+                                               'number_of_points'),
+                                   **compress_kwargs)
             outfile.createVariable(q + Write_sts.RANGE, precis,
                                    ('numbers_in_range',))
 
@@ -814,7 +896,8 @@ class Write_sww(Write_sts):
 
         for q in self.dynamic_c_quantities:
             outfile.createVariable(q, precis, ('number_of_timesteps',
-                                               'number_of_volumes'))
+                                               'number_of_volumes'),
+                                   **compress_kwargs)
 
         # Doing sts_precision instead of Float gives cast errors.
         outfile.createVariable('time', netcdf_float, ('number_of_timesteps',))

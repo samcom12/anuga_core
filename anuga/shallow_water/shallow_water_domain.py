@@ -2581,6 +2581,11 @@ class Domain(Generic_Domain):
         #nvtx marker
         nvtxRangePop()
 
+        # Ensure any pending async SWW write finishes before returning.
+        if self.store and hasattr(self, 'writer') and self.writer is not None:
+            if hasattr(self.writer, 'wait_for_pending_write'):
+                self.writer.wait_for_pending_write()
+
 
     def initialise_storage(self):
         """Create and initialise self.writer object for storing data.
