@@ -489,6 +489,18 @@ double gpu_rate_operator_apply_array(struct gpu_domain *GD, int op_id,
 
 // Ghost exchange - the key MPI function
 // Uses GPU-aware MPI if available, otherwise does D2H/H2D for small halo buffers
+//
+// Split API for computation-communication overlap:
+//   gpu_exchange_ghosts_begin: pack halo on GPU, post MPI_Irecv BEFORE D2H,
+//                              then D2H, then post MPI_Isend.
+//   gpu_exchange_ghosts_end:   MPI_Waitall + H2D + unpack on GPU.
+//
+// GPU kernels that operate only on interior/local cells (e.g. gpu_protect) can
+// be launched between begin and end to overlap with the MPI transfer.
+//
+// gpu_exchange_ghosts is a convenience wrapper: begin + end with nothing between.
+void gpu_exchange_ghosts_begin(struct gpu_domain *GD);
+void gpu_exchange_ghosts_end(struct gpu_domain *GD);
 void gpu_exchange_ghosts(struct gpu_domain *GD);
 
 // GPU kernels (stubs - will be implemented in sw_domain_gpu.c)

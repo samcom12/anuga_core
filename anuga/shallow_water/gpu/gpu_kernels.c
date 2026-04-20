@@ -209,36 +209,45 @@ double gpu_evolve_one_rk2_step(struct gpu_domain *GD, double max_timestep, int a
     // Compute fluxes - returns local minimum timestep
     local_timestep = gpu_compute_fluxes(GD);
 
-    // Compute global timestep
-    if (GD->fixed_flux_timestep > 0.0) {
-        // Fixed timestep - skip MPI allreduce entirely
-        if (GD->rank == 0 && !GD->fixed_ts_printed) {
-            printf("Using a fixed timestep! (dt = %e)\n", GD->fixed_flux_timestep);
-            fflush(stdout);
-            GD->fixed_ts_printed = 1;
-        }
-        timestep = GD->fixed_flux_timestep;
-        if (timestep > max_timestep) {
-            timestep = max_timestep;
-        }
-    } else {
-        // MPI reduce to get global minimum timestep
-        if (GD->nprocs > 1) {
-            MPI_Allreduce(&local_timestep, &global_timestep, 1, MPI_DOUBLE, MPI_MIN, GD->comm);
+    // Overlap: post non-blocking MPI allreduce then run Manning friction on the
+    // GPU while the collective is in flight on the network.  Manning friction
+    // only writes into explicit_update arrays and does not read the global
+    // timestep, so the overlap is always safe.
+    {
+        int use_nonblocking_reduce = (GD->fixed_flux_timestep <= 0.0 && GD->nprocs > 1);
+        MPI_Request ts_req = MPI_REQUEST_NULL;
+
+        if (GD->fixed_flux_timestep > 0.0) {
+            if (GD->rank == 0 && !GD->fixed_ts_printed) {
+                printf("Using a fixed timestep! (dt = %e)\n", GD->fixed_flux_timestep);
+                fflush(stdout);
+                GD->fixed_ts_printed = 1;
+            }
+            timestep = GD->fixed_flux_timestep;
+            if (timestep > max_timestep) timestep = max_timestep;
+        } else if (use_nonblocking_reduce) {
+            // Non-blocking: Manning friction runs on GPU while MPI progresses
+            MPI_Iallreduce(&local_timestep, &global_timestep, 1, MPI_DOUBLE,
+                           MPI_MIN, GD->comm, &ts_req);
         } else {
             global_timestep = local_timestep;
         }
 
-        // Apply CFL condition and respect max_timestep from Python
-        timestep = GD->CFL * global_timestep;
-        if (timestep > max_timestep) {
-            timestep = max_timestep;
+        // GPU Manning friction overlaps with MPI allreduce
+        if (apply_forcing) {
+            gpu_manning_friction(GD);
         }
-    }
 
-    // Apply forcing terms (Manning friction on GPU)
-    if (apply_forcing) {
-        gpu_manning_friction(GD);
+        // Complete allreduce and derive timestep
+        if (use_nonblocking_reduce) {
+            MPI_Wait(&ts_req, MPI_STATUS_IGNORE);
+            timestep = GD->CFL * global_timestep;
+            if (timestep > max_timestep) timestep = max_timestep;
+        } else if (GD->fixed_flux_timestep <= 0.0) {
+            // Single-rank CFL path (global_timestep == local_timestep)
+            timestep = GD->CFL * global_timestep;
+            if (timestep > max_timestep) timestep = max_timestep;
+        }
     }
 
     // Update conserved quantities with computed timestep
@@ -320,26 +329,38 @@ double gpu_evolve_one_rk3_step(struct gpu_domain *GD, double max_timestep, int a
 
     local_timestep = gpu_compute_fluxes(GD);
 
-    // Determine global timestep (same logic as RK2)
-    if (GD->fixed_flux_timestep > 0.0) {
-        if (GD->rank == 0 && !GD->fixed_ts_printed_rk3) {
-            printf("RK3: Using a fixed timestep! (dt = %e)\n", GD->fixed_flux_timestep);
-            fflush(stdout);
-            GD->fixed_ts_printed_rk3 = 1;
-        }
-        timestep = GD->fixed_flux_timestep;
-        if (timestep > max_timestep) timestep = max_timestep;
-    } else {
-        if (GD->nprocs > 1) {
-            MPI_Allreduce(&local_timestep, &global_timestep, 1, MPI_DOUBLE, MPI_MIN, GD->comm);
+    // Overlap: non-blocking allreduce + Manning friction on GPU (same pattern as RK2)
+    {
+        int use_nonblocking_reduce = (GD->fixed_flux_timestep <= 0.0 && GD->nprocs > 1);
+        MPI_Request ts_req = MPI_REQUEST_NULL;
+
+        if (GD->fixed_flux_timestep > 0.0) {
+            if (GD->rank == 0 && !GD->fixed_ts_printed_rk3) {
+                printf("RK3: Using a fixed timestep! (dt = %e)\n", GD->fixed_flux_timestep);
+                fflush(stdout);
+                GD->fixed_ts_printed_rk3 = 1;
+            }
+            timestep = GD->fixed_flux_timestep;
+            if (timestep > max_timestep) timestep = max_timestep;
+        } else if (use_nonblocking_reduce) {
+            MPI_Iallreduce(&local_timestep, &global_timestep, 1, MPI_DOUBLE,
+                           MPI_MIN, GD->comm, &ts_req);
         } else {
             global_timestep = local_timestep;
         }
-        timestep = GD->CFL * global_timestep;
-        if (timestep > max_timestep) timestep = max_timestep;
+
+        if (apply_forcing) gpu_manning_friction(GD);
+
+        if (use_nonblocking_reduce) {
+            MPI_Wait(&ts_req, MPI_STATUS_IGNORE);
+            timestep = GD->CFL * global_timestep;
+            if (timestep > max_timestep) timestep = max_timestep;
+        } else if (GD->fixed_flux_timestep <= 0.0) {
+            timestep = GD->CFL * global_timestep;
+            if (timestep > max_timestep) timestep = max_timestep;
+        }
     }
 
-    if (apply_forcing) gpu_manning_friction(GD);
     gpu_update_conserved_quantities(GD, timestep);
 
     if (GD->nprocs > 1) gpu_exchange_ghosts(GD);
