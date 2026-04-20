@@ -56,7 +56,7 @@ size_t gpu_estimate_required_memory(anuga_int n, anuga_int nb) {
     //   number_of_boundaries(n), tri_full_flag(n)                         = 11n int64
     //
     // Backup values (double): stage, xmom, ymom = 3n  (mapped in map_backup_arrays)
-    //   — not mapped here but count as we typically allocate them
+    //   -- not mapped here but count as we typically allocate them
     //
     // Boundary arrays (small): 5 x nb doubles
     size_t double_bytes = (size_t)(71) * (size_t)n * sizeof(double);
@@ -80,7 +80,7 @@ int gpu_query_device_memory(size_t *free_bytes, size_t *total_bytes) {
 #if defined(USE_CUDA)
     cudaError_t err = cudaMemGetInfo(free_bytes, total_bytes);
     if (err != cudaSuccess) {
-        return 1;   // Can't query — don't block
+        return 1;   // Can't query -- don't block
     }
     return 1;  // Caller decides if enough
 #elif defined(USE_HIP)
@@ -91,7 +91,7 @@ int gpu_query_device_memory(size_t *free_bytes, size_t *total_bytes) {
     return 1;
 #else
     // No vendor API available (CPU_ONLY_MODE or unknown target).
-    // Report unlimited — mapping will silently run on host.
+    // Report unlimited -- mapping will silently run on host.
     return 1;
 #endif
 }
@@ -372,9 +372,20 @@ void gpu_domain_finalize(struct gpu_domain *GD) {
 
 int gpu_domain_map_arrays(struct gpu_domain *GD) {
     if (GD->gpu_initialized) return 1;
-    // Note: Don't return early if device_id < 0. With OMP_TARGET_OFFLOAD=disabled,
-    // the OpenMP target directives run on CPU, so we still need to set up the
-    // data structures and flags for the boundary/kernel functions to work.
+
+    // On pure CPU runs (no GPU device available), skip all device data mapping.
+    // The OMP_PARALLEL_LOOP target kernels will execute on the host device
+    // automatically.  Attempting #pragma omp target enter data without a real
+    // device causes a runtime error in most OpenMP runtimes unless
+    // OMP_TARGET_OFFLOAD=disabled is set explicitly.
+    if (GD->device_id < 0) {
+        GD->gpu_initialized = 1;
+        if (GD->rank == 0 && GD->verbose) {
+            printf("  No GPU device -- running kernels on host (CPU mode)\n");
+            fflush(stdout);
+        }
+        return 1;
+    }
 
     // Check device memory before attempting any mapping.
     // Returns 0 and prints a clear error if there isn't enough free memory.
@@ -669,6 +680,27 @@ void gpu_remap_boundary_arrays(struct gpu_domain *GD) {
     // Remap boundary arrays that were initialized after the initial map_to_gpu call.
     // This is needed when set_boundary() is called AFTER set_multiprocessor_mode().
 
+    // On CPU-only runs there is no device to map to -- just mark boundaries as
+    // "mapped" (arrays are already in host memory and accessible directly).
+    if (GD->device_id < 0) {
+        struct reflective_boundary *R = &GD->reflective;
+        if (R->num_edges > 0 && R->boundary_indices != NULL && !R->mapped)
+            R->mapped = 1;
+        struct dirichlet_boundary *Dir = &GD->dirichlet;
+        if (Dir->num_edges > 0 && Dir->boundary_indices != NULL && !Dir->mapped)
+            Dir->mapped = 1;
+        struct transmissive_boundary *T = &GD->transmissive;
+        if (T->num_edges > 0 && T->boundary_indices != NULL && !T->mapped)
+            T->mapped = 1;
+        struct transmissive_n_zero_t_boundary *Tnzt = &GD->transmissive_n_zero_t;
+        if (Tnzt->num_edges > 0 && Tnzt->boundary_indices != NULL && !Tnzt->mapped)
+            Tnzt->mapped = 1;
+        struct time_boundary *TB = &GD->time_bdry;
+        if (TB->num_edges > 0 && TB->boundary_indices != NULL && !TB->mapped)
+            TB->mapped = 1;
+        return;
+    }
+
     // Map reflective boundary arrays if initialized but not yet mapped
     struct reflective_boundary *R = &GD->reflective;
     if (R->num_edges > 0 && R->boundary_indices != NULL && !R->mapped) {
@@ -757,6 +789,13 @@ void gpu_remap_boundary_arrays(struct gpu_domain *GD) {
 
 void gpu_domain_unmap_arrays(struct gpu_domain *GD) {
     if (!GD->gpu_initialized) return;
+
+    // If no GPU device was used, there is nothing to unmap -- arrays were
+    // never moved to a device.
+    if (GD->device_id < 0) {
+        GD->gpu_initialized = 0;
+        return;
+    }
 
     anuga_int n = GD->D.number_of_elements;
     anuga_int nb = GD->D.boundary_length;
@@ -987,6 +1026,7 @@ void gpu_domain_unmap_arrays(struct gpu_domain *GD) {
 void gpu_domain_sync_to_device(struct gpu_domain *GD) {
     // Sync all centroid values to GPU (use at start of GPU computation)
     if (!GD->gpu_initialized) return;
+    if (GD->device_id < 0) return;  // No device -- data already on host
 
     anuga_int n = GD->D.number_of_elements;
     double *stage_cv = GD->D.stage_centroid_values;
@@ -1000,6 +1040,7 @@ void gpu_domain_sync_to_device(struct gpu_domain *GD) {
 void gpu_domain_sync_from_device(struct gpu_domain *GD) {
     // Sync centroid values from GPU (use at yieldstep for Python I/O)
     if (!GD->gpu_initialized) return;
+    if (GD->device_id < 0) return;  // No device -- data already on host
 
     anuga_int n = GD->D.number_of_elements;
     double *stage_cv = GD->D.stage_centroid_values;
@@ -1013,6 +1054,7 @@ void gpu_domain_sync_from_device(struct gpu_domain *GD) {
 void gpu_domain_sync_all_from_device(struct gpu_domain *GD) {
     // Sync ALL arrays from GPU (for debugging/testing intermediate values)
     if (!GD->gpu_initialized) return;
+    if (GD->device_id < 0) return;  // No device -- data already on host
 
     anuga_int n = GD->D.number_of_elements;
     anuga_int nb = GD->D.boundary_length;
@@ -1073,6 +1115,7 @@ void gpu_domain_sync_all_from_device(struct gpu_domain *GD) {
 void gpu_sync_boundary_values(struct gpu_domain *GD) {
     // Sync boundary values TO GPU (after CPU boundary evaluation)
     if (!GD->gpu_initialized) return;
+    if (GD->device_id < 0) return;  // No device -- data already on host
 
     anuga_int nb = GD->D.boundary_length;
     if (nb == 0) return;
@@ -1090,6 +1133,7 @@ void gpu_sync_boundary_values(struct gpu_domain *GD) {
 void gpu_sync_edge_values_from_device(struct gpu_domain *GD) {
     // Sync ALL edge values FROM GPU - expensive, use sparse version if possible
     if (!GD->gpu_initialized) return;
+    if (GD->device_id < 0) return;  // No device -- data already on host
 
     anuga_int n = GD->D.number_of_elements;
 
@@ -1135,7 +1179,7 @@ int gpu_boundary_edge_sync_init(struct gpu_domain *GD,
     S->bed_buf = (double*)malloc(S->buf_size * sizeof(double));
     S->height_buf = (double*)malloc(S->buf_size * sizeof(double));
 
-    // Map all buffers to GPU once
+    // Map all buffers to GPU once -- skip on CPU-only runs (no device)
     int nc = num_boundary_cells;
     int bs = S->buf_size;
     int *cell_ids_ptr = S->cell_ids;
@@ -1145,9 +1189,11 @@ int gpu_boundary_edge_sync_init(struct gpu_domain *GD,
     double *bed_buf = S->bed_buf;
     double *height_buf = S->height_buf;
 
-    #pragma omp target enter data map(to: cell_ids_ptr[0:nc]) \
-        map(alloc: stage_buf[0:bs], xmom_buf[0:bs], ymom_buf[0:bs], \
-                   bed_buf[0:bs], height_buf[0:bs])
+    if (GD->device_id >= 0) {
+        #pragma omp target enter data map(to: cell_ids_ptr[0:nc]) \
+            map(alloc: stage_buf[0:bs], xmom_buf[0:bs], ymom_buf[0:bs], \
+                       bed_buf[0:bs], height_buf[0:bs])
+    }
 
     S->initialized = 1;
     if (GD->verbose) {
@@ -1166,19 +1212,21 @@ void gpu_boundary_edge_sync_finalize(struct gpu_domain *GD) {
     if (!S->initialized) return;
 
     if (S->num_boundary_cells > 0) {
-        // Unmap from GPU
-        int nc = S->num_boundary_cells;
-        int bs = S->buf_size;
-        int *cell_ids_ptr = S->cell_ids;
-        double *stage_buf = S->stage_buf;
-        double *xmom_buf = S->xmom_buf;
-        double *ymom_buf = S->ymom_buf;
-        double *bed_buf = S->bed_buf;
-        double *height_buf = S->height_buf;
+        // Unmap from GPU (only if arrays were mapped to a device)
+        if (GD->device_id >= 0) {
+            int nc = S->num_boundary_cells;
+            int bs = S->buf_size;
+            int *cell_ids_ptr = S->cell_ids;
+            double *stage_buf = S->stage_buf;
+            double *xmom_buf = S->xmom_buf;
+            double *ymom_buf = S->ymom_buf;
+            double *bed_buf = S->bed_buf;
+            double *height_buf = S->height_buf;
 
-        #pragma omp target exit data map(delete: cell_ids_ptr[0:nc], \
-            stage_buf[0:bs], xmom_buf[0:bs], ymom_buf[0:bs], \
-            bed_buf[0:bs], height_buf[0:bs])
+            #pragma omp target exit data map(delete: cell_ids_ptr[0:nc], \
+                stage_buf[0:bs], xmom_buf[0:bs], ymom_buf[0:bs], \
+                bed_buf[0:bs], height_buf[0:bs])
+        }
 
         // Free host memory
         free(S->cell_ids);
@@ -1236,9 +1284,11 @@ void gpu_boundary_edge_sync(struct gpu_domain *GD) {
         }
     }
 
-    // Sync staging buffers from GPU to host
-    #pragma omp target update from(stage_buf[0:bs], xmom_buf[0:bs], ymom_buf[0:bs], \
-                                   bed_buf[0:bs], height_buf[0:bs])
+    // Sync staging buffers from GPU to host (no-op on CPU -- data already in host memory)
+    if (GD->device_id >= 0) {
+        #pragma omp target update from(stage_buf[0:bs], xmom_buf[0:bs], ymom_buf[0:bs], \
+                                       bed_buf[0:bs], height_buf[0:bs])
+    }
 
     // Scatter on CPU to the actual edge value arrays (host copies)
     for (int i = 0; i < nc; i++) {
