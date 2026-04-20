@@ -50,7 +50,11 @@ struct halo_exchange {
     double *host_recv_buffer;    // [3 * total_recv_size]  (GPU_AWARE_MPI only)
 
     // MPI request arrays for non-blocking communication
+    // When use_persistent == 1 these are pre-initialised persistent requests
+    // (MPI_Recv_init / MPI_Send_init) that are restarted each step with
+    // MPI_Startall instead of allocating fresh Irecv/Isend handles.
     MPI_Request *requests;       // [2 * num_neighbors] for Isend/Irecv pairs
+    int use_persistent;          // 1 if requests[] holds persistent handles
 };
 
 // Reflective boundary info - stored on GPU for efficient evaluation

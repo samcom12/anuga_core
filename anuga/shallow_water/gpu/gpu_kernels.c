@@ -253,16 +253,21 @@ double gpu_evolve_one_rk2_step(struct gpu_domain *GD, double max_timestep, int a
     // Update conserved quantities with computed timestep
     gpu_update_conserved_quantities(GD, timestep);
 
-    // Ghost exchange (MPI) - sync ghost cells between processes
-    if (GD->nprocs > 1) {
-        gpu_exchange_ghosts(GD);
-    }
-
     // ========================================
     // Second Euler step
     // ========================================
 
-    gpu_protect(GD);
+    // Interior/halo compute overlap: begin MPI ghost exchange, then run
+    // gpu_protect (which only touches local cells — no ghost dependencies),
+    // then complete the exchange.  This hides the MPI latency behind protect.
+    if (GD->nprocs > 1) {
+        gpu_exchange_ghosts_begin(GD);
+        gpu_protect(GD);
+        gpu_exchange_ghosts_end(GD);
+    } else {
+        gpu_protect(GD);
+    }
+
     gpu_extrapolate_second_order(GD);
 
     // Evaluate boundary conditions (same as first step)
@@ -363,13 +368,19 @@ double gpu_evolve_one_rk3_step(struct gpu_domain *GD, double max_timestep, int a
 
     gpu_update_conserved_quantities(GD, timestep);
 
-    if (GD->nprocs > 1) gpu_exchange_ghosts(GD);
+    // Interior/halo overlap: begin exchange, protect (local only), end exchange
+    if (GD->nprocs > 1) {
+        gpu_exchange_ghosts_begin(GD);
+        gpu_protect(GD);
+        gpu_exchange_ghosts_end(GD);
+    } else {
+        gpu_protect(GD);
+    }
 
     // ========================================
     // Stage 2: Q^(2) = Q^(1) + h*L(Q^(1))
     // ========================================
 
-    gpu_protect(GD);
     gpu_extrapolate_second_order(GD);
 
     gpu_evaluate_reflective_boundary(GD);
@@ -385,13 +396,20 @@ double gpu_evolve_one_rk3_step(struct gpu_domain *GD, double max_timestep, int a
 
     // Intermediate: Q = 0.25*Q^(2) + 0.75*Q^n, then sync ghost cells
     gpu_saxpy_conserved_quantities(GD, 0.25, 0.75);
-    if (GD->nprocs > 1) gpu_exchange_ghosts(GD);
+
+    // Interior/halo overlap: begin exchange, protect (local only), end exchange
+    if (GD->nprocs > 1) {
+        gpu_exchange_ghosts_begin(GD);
+        gpu_protect(GD);
+        gpu_exchange_ghosts_end(GD);
+    } else {
+        gpu_protect(GD);
+    }
 
     // ========================================
     // Stage 3: Q^(3) = Q^(1)_mid + h*L(Q^(1)_mid)
     // ========================================
 
-    gpu_protect(GD);
     gpu_extrapolate_second_order(GD);
 
     gpu_evaluate_reflective_boundary(GD);
