@@ -190,6 +190,11 @@ class Parallel_domain(Domain):
 
         """
 
+        # When parallel MPI-IO was used all ranks wrote to a single shared
+        # file directly — no per-rank files were created, so no merge is needed.
+        if getattr(self, 'sww_parallel_write', False):
+            return
+
         # make sure all the computations have finished
 
         pypar.barrier()
@@ -207,6 +212,7 @@ class Parallel_domain(Domain):
         # processors complete (like when finalize is forgotten in main script)
 
         pypar.barrier()
+
 
     def write_time(self):
 

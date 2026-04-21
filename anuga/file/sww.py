@@ -529,6 +529,419 @@ class SWW_file(Data_format):
             log.info('SWW_file.__del__: error during async write cleanup: %s' % exc)
 
 
+class Parallel_SWW_file:
+    """Parallel NetCDF MPI-IO writer for SWW files.
+
+    All MPI ranks write collectively to a single shared .sww file using
+    netCDF4 parallel I/O (HDF5 backend).  This eliminates the post-run
+    ``sww_merge`` step and improves write throughput on parallel filesystems.
+
+    Requires
+    --------
+    * ``netCDF4`` built with parallel HDF5 support
+      (``nc-config --has-parallel4`` should print ``yes``).
+    * ``mpi4py`` installed.
+    * The domain must have ``tri_l2g``, ``node_l2g``, ``tri_full_flag``,
+      ``number_of_global_triangles``, and ``number_of_global_nodes``
+      attributes (all present on ``Parallel_domain`` instances).
+
+    Usage
+    -----
+    Set ``domain.sww_parallel_write = True`` before the evolve loop::
+
+        domain.sww_parallel_write = True
+        for t in domain.evolve(yieldstep=10, finaltime=100):
+            ...
+        # No sww_merge() call needed — the single shared file is complete.
+
+    Only smooth-mesh mode (``domain.smooth = True``, the default for
+    parallel domains) is supported.
+    """
+
+    def __init__(self, domain, mode=netcdf_mode_w, max_size=None,
+                 recursion=False):
+        try:
+            from mpi4py import MPI
+            from netCDF4 import Dataset  # noqa: F401 — verify import works
+        except ImportError as exc:
+            raise ImportError(
+                "Parallel_SWW_file requires mpi4py and netCDF4 with "
+                "parallel HDF5 support.  Error: %s" % exc
+            ) from exc
+
+        from mpi4py import MPI
+
+        self._MPI = MPI
+        self._comm = MPI.COMM_WORLD
+        self._rank = domain.processor
+        self._nprocs = domain.numproc
+
+        # Local-to-global index maps (set by Parallel_domain constructor)
+        self._tri_l2g = domain.tri_l2g
+        self._node_l2g = domain.node_l2g
+        self._tri_full_flag = domain.tri_full_flag
+        self._n_global_triangles = domain.number_of_global_triangles
+        self._n_global_nodes = domain.number_of_global_nodes
+
+        self.precision = netcdf_float32
+        self.domain = domain
+        self._timestep_count = 0
+
+        # Compression (requires NETCDF4 format — already enforced here)
+        self.zlib_compression = bool(getattr(domain, 'sww_zlib_compression', False))
+        self.zlib_complevel = int(getattr(domain, 'sww_zlib_complevel', 4))
+
+        # Centroid storage
+        self.store_centroids = bool(getattr(domain, 'store_centroids', False))
+
+        # Minimum storable height
+        if hasattr(domain, 'minimum_storable_height'):
+            self.minimum_storable_height = domain.minimum_storable_height
+        else:
+            self.minimum_storable_height = default_minimum_storable_height
+
+        # Shared filename: uses the global (non-rank-specific) name
+        self.filename = create_filename(
+            domain.get_datadir(), domain.get_global_name(), 'sww')
+
+        # Classify stored quantities
+        static_quantities = []
+        dynamic_quantities = []
+        static_c_quantities = []
+        dynamic_c_quantities = []
+
+        if not domain.smooth:
+            raise ValueError(
+                "Parallel_SWW_file only supports smooth-mesh mode "
+                "(domain.smooth=True).  Non-smooth (unique-vertex) mode "
+                "is not yet implemented for parallel MPI-IO.")
+
+        for q in domain.quantities_to_be_stored:
+            flag = domain.quantities_to_be_stored[q]
+            assert q in domain.quantities, \
+                'Quantity %s not in domain.quantities' % q
+            assert flag in [1, 2]
+            if flag == 1:
+                static_quantities.append(q)
+                if self.store_centroids:
+                    static_c_quantities.append(q + '_c')
+            if flag == 2:
+                dynamic_quantities.append(q)
+                if self.store_centroids:
+                    dynamic_c_quantities.append(q + '_c')
+
+        self.static_quantities = static_quantities
+        self.dynamic_quantities = dynamic_quantities
+        self.static_c_quantities = static_c_quantities
+        self.dynamic_c_quantities = dynamic_c_quantities
+
+        # Create the file (all ranks participate collectively)
+        if mode[0] == 'w':
+            self._create_file_header(domain)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _open(self, mode='r+'):
+        """Open the shared NetCDF file in parallel mode (collective)."""
+        from mpi4py import MPI
+        from netCDF4 import Dataset
+
+        try:
+            fid = Dataset(
+                self.filename, mode, format='NETCDF4',
+                parallel=True, comm=self._comm, info=MPI.Info())
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to open '%s' in parallel netCDF4 mode.  "
+                "Ensure netCDF4 was compiled with parallel HDF5 support "
+                "(nc-config --has-parallel4 should print 'yes').  "
+                "Error: %s" % (self.filename, exc)
+            ) from exc
+        return fid
+
+    def _full_nodes_of_rank(self, V):
+        """Return (fl_nodes, g_full_nodes) for this rank's full triangles.
+
+        Parameters
+        ----------
+        V : ndarray, shape (n_local_tris, 3)
+            Local vertex-index connectivity array.
+
+        Returns
+        -------
+        fl_nodes : ndarray of int
+            Unique local node indices that belong to at least one full tri.
+        g_full_nodes : ndarray of int
+            Corresponding global node indices (``node_l2g[fl_nodes]``).
+        """
+        full_mask = self._tri_full_flag > 0
+        V_full = V[full_mask].astype(int)
+        if V_full.size > 0:
+            fl_nodes = num.unique(V_full)
+            g_full_nodes = self._node_l2g[fl_nodes]
+        else:
+            fl_nodes = num.array([], dtype=int)
+            g_full_nodes = num.array([], dtype=int)
+        return fl_nodes, g_full_nodes
+
+    # ------------------------------------------------------------------
+    # File creation
+    # ------------------------------------------------------------------
+
+    def _create_file_header(self, domain):
+        """Create the NETCDF4 file with global dimensions (collective)."""
+        fid = self._open('w')
+
+        # --- Global metadata ---
+        fid.institution = getattr(domain, 'institution', default_institution)
+        fid.description = 'Output from anuga.file.sww suitable for plotting'
+
+        if domain.smooth:
+            fid.smoothing = 'Yes'
+            fid.vertices_are_stored_uniquely = 'False'
+        else:
+            fid.smoothing = 'No'
+            fid.vertices_are_stored_uniquely = 'True'
+
+        fid.order = domain.default_order
+        fid.starttime = float(domain.starttime)
+        fid.timezone = str(getattr(domain, 'timezone', 'UTC'))
+
+        from anuga import get_revision_number, get_revision_date, get_version
+        try:
+            fid.revision_number = str(get_revision_number())
+        except Exception:
+            fid.revision_number = 'None'
+        try:
+            fid.revision_date = str(get_revision_date())
+        except Exception:
+            fid.revision_date = 'None'
+        try:
+            fid.anuga_version = str(get_version())
+        except Exception:
+            fid.anuga_version = 'None'
+
+        # Geo-reference attributes (xllcorner, yllcorner, zone, …)
+        domain.geo_reference.write_NetCDF(fid)
+
+        # --- Dimensions ---
+        fid.createDimension('number_of_volumes', self._n_global_triangles)
+        fid.createDimension('number_of_triangle_vertices',
+                            self._n_global_nodes)
+        fid.createDimension('number_of_vertices', 3)
+        fid.createDimension('numbers_in_range', 2)
+        fid.createDimension('number_of_points', self._n_global_nodes)
+        fid.createDimension('number_of_timesteps', None)   # unlimited
+
+        # --- Static geometry variables ---
+        fid.createVariable('x', self.precision, ('number_of_points',))
+        fid.createVariable('y', self.precision, ('number_of_points',))
+        fid.createVariable('volumes', netcdf_int,
+                           ('number_of_volumes', 'number_of_vertices'))
+
+        for q in self.static_quantities:
+            fid.createVariable(q, self.precision, ('number_of_points',))
+            v = fid.createVariable(q + '_range', self.precision,
+                                   ('numbers_in_range',))
+            v[0] = max_float
+            v[1] = -max_float
+
+        for q in self.static_c_quantities:
+            fid.createVariable(q, self.precision, ('number_of_volumes',))
+
+        # --- Dynamic variables ---
+        compress_kwargs = {}
+        if self.zlib_compression:
+            compress_kwargs = {'zlib': True, 'complevel': self.zlib_complevel}
+
+        for q in self.dynamic_quantities:
+            var = fid.createVariable(
+                q, self.precision,
+                ('number_of_timesteps', 'number_of_points'),
+                **compress_kwargs)
+            var.set_collective(True)   # collective I/O for unlimited dim
+            v = fid.createVariable(q + '_range', self.precision,
+                                   ('numbers_in_range',))
+            v[0] = max_float
+            v[1] = -max_float
+
+        for q in self.dynamic_c_quantities:
+            var = fid.createVariable(
+                q, self.precision,
+                ('number_of_timesteps', 'number_of_volumes'),
+                **compress_kwargs)
+            var.set_collective(True)
+
+        time_var = fid.createVariable(
+            'time', netcdf_float, ('number_of_timesteps',))
+        time_var.set_collective(True)
+
+        fid.close()
+
+    # ------------------------------------------------------------------
+    # Public interface (mirrors SWW_file)
+    # ------------------------------------------------------------------
+
+    def store_connectivity(self):
+        """Write mesh geometry and static quantities in parallel.
+
+        All ranks participate collectively.  Each rank writes its own
+        local nodes/triangles to the correct global positions.  Ghost
+        triangles are excluded; ghost nodes are written by their owning rank.
+        """
+        domain = self.domain
+        node_l2g = self._node_l2g
+        tri_l2g = self._tri_l2g
+        full_mask = self._tri_full_flag > 0
+
+        # Vertex coordinates and connectivity
+        Q_ref = list(domain.quantities.values())[0]
+        X, Y, _, V = Q_ref.get_vertex_values(xy=True, precision=self.precision)
+        # X, Y: shape (n_local_nodes,)
+        # V:    shape (n_local_tris, 3) — local node indices
+
+        fl_nodes, g_full_nodes = self._full_nodes_of_rank(V)
+
+        fid = self._open('r+')
+
+        # Enable collective I/O on static geometry (helps HDF5 performance)
+        fid.variables['x'].set_collective(True)
+        fid.variables['y'].set_collective(True)
+        fid.variables['volumes'].set_collective(True)
+
+        # x, y: write all local nodes to their global positions.
+        # Nodes on partition boundaries are shared between ranks and will be
+        # written by each rank that owns them.  Since coordinates are
+        # identical across ranks for shared nodes, concurrent writes are
+        # safe.  A future optimisation could assign exclusive ownership
+        # (e.g. each node written only by the lowest-rank owner) to
+        # reduce write contention on large parallel filesystems.
+        fid.variables['x'][node_l2g] = X
+        fid.variables['y'][node_l2g] = Y
+
+        # volumes: full triangles only, translating to global node indices
+        V_full = V[full_mask].astype(int)
+        tri_l2g_full = tri_l2g[full_mask]
+        if V_full.size > 0:
+            g_volumes = node_l2g[V_full]   # (n_full_tris, 3) global indices
+            fid.variables['volumes'][tri_l2g_full] = g_volumes
+
+        # Static vertex quantities (full nodes only)
+        for name in self.static_quantities:
+            Q = domain.quantities[name]
+            A, _ = Q.get_vertex_values(xy=False, precision=self.precision)
+            fid.variables[name].set_collective(True)
+            if g_full_nodes.size > 0:
+                fid.variables[name][g_full_nodes] = A[fl_nodes]
+                local_min = float(num.min(A[fl_nodes]))
+                local_max = float(num.max(A[fl_nodes]))
+            else:
+                local_min = max_float
+                local_max = -max_float
+            # All ranks participate in Allreduce (required for MPI correctness)
+            g_min = self._comm.allreduce(local_min, op=self._MPI.MIN)
+            g_max = self._comm.allreduce(local_max, op=self._MPI.MAX)
+            if self._rank == 0:
+                fid.variables[name + '_range'][0] = g_min
+                fid.variables[name + '_range'][1] = g_max
+
+        # Static centroid quantities (full triangles only)
+        for name in self.static_c_quantities:
+            q_name = name[:-2]
+            Q = domain.quantities[q_name]
+            fid.variables[name].set_collective(True)
+            if full_mask.any():
+                fid.variables[name][tri_l2g[full_mask]] = \
+                    Q.centroid_values[full_mask].astype(self.precision)
+
+        fid.close()
+
+    def store_timestep(self):
+        """Write dynamic quantities for the current timestep in parallel.
+
+        All ranks participate collectively.  Each rank writes to the global
+        node/triangle indices corresponding to its full (non-ghost) cells.
+        """
+        domain = self.domain
+        node_l2g = self._node_l2g
+        tri_l2g = self._tri_l2g
+        full_mask = self._tri_full_flag > 0
+        t_idx = self._timestep_count
+
+        Q_ref = list(domain.quantities.values())[0]
+        _, _, _, V = Q_ref.get_vertex_values(xy=True, precision=self.precision)
+        fl_nodes, g_full_nodes = self._full_nodes_of_rank(V)
+
+        fid = self._open('r+')
+
+        # Time variable (collective — extends unlimited dimension)
+        fid.variables['time'].set_collective(True)
+        fid.variables['time'][t_idx] = domain.relative_time
+
+        # Storable-height mask (wet/dry)
+        z = None
+        storable_indices = None
+        if 'stage' in self.dynamic_quantities:
+            w, _ = domain.quantities['stage'].get_vertex_values(xy=False)
+            z, _ = domain.quantities['elevation'].get_vertex_values(xy=False)
+            storable_indices = num.array(
+                w - z >= self.minimum_storable_height)
+
+        # Dynamic vertex quantities
+        for name in self.dynamic_quantities:
+            Q = domain.quantities[name]
+            A, _ = Q.get_vertex_values(xy=False, precision=self.precision)
+            if storable_indices is not None:
+                if name == 'stage':
+                    A = num.choose(storable_indices, (z, A))
+                elif name in ['xmomentum', 'ymomentum']:
+                    zero_momentum = num.zeros(num.size(A), A.dtype.char)
+                    A = num.choose(storable_indices, (zero_momentum, A))
+
+            fid.variables[name].set_collective(True)
+            if g_full_nodes.size > 0:
+                fid.variables[name][t_idx, g_full_nodes] = A[fl_nodes]
+                local_min = float(num.min(A[fl_nodes]))
+                local_max = float(num.max(A[fl_nodes]))
+            else:
+                local_min = max_float
+                local_max = -max_float
+            # All ranks participate in Allreduce (required for MPI correctness)
+            g_min = self._comm.allreduce(local_min, op=self._MPI.MIN)
+            g_max = self._comm.allreduce(local_max, op=self._MPI.MAX)
+            if self._rank == 0:
+                q_range = fid.variables[name + '_range'][:]
+                if g_min < q_range[0]:
+                    fid.variables[name + '_range'][0] = g_min
+                if g_max > q_range[1]:
+                    fid.variables[name + '_range'][1] = g_max
+
+        # Dynamic centroid quantities
+        for name in self.dynamic_c_quantities:
+            q_name = name[:-2]
+            Q = domain.quantities[q_name]
+            fid.variables[name].set_collective(True)
+            if full_mask.any():
+                fid.variables[name][t_idx, tri_l2g[full_mask]] = \
+                    Q.centroid_values[full_mask].astype(self.precision)
+
+        fid.close()
+        self._timestep_count += 1
+
+    def wait_for_pending_write(self):
+        """No async writes in parallel mode — always synchronous."""
+        pass
+
+    def close(self):
+        """No background executor to shut down in parallel mode."""
+        pass
+
+    def __del__(self):
+        pass
+
+
 class Read_sww:
 
     def __init__(self, source):
