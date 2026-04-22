@@ -342,7 +342,7 @@ class SWW_file(Data_format):
 
         # Check to see if the file is already too big:
         time_len = fid.variables['time'].shape[0]
-        i = len(time_arr) + 1
+        i = time_len + 1
         file_size = stat(self.filename)[6]
         file_size_increase = file_size // i
         fid.close()
