@@ -1453,6 +1453,147 @@ class Test_Domain_delegation(unittest.TestCase):
         domain.set_multiprocessor_mode(1)
         self.assertEqual(domain.get_multiprocessor_mode(), 1)
 
+    # ------------------------------------------------------------------
+    # Tests for gradient workspace arrays added in this PR
+    # (generic_domain.py lines 473-478)
+    # ------------------------------------------------------------------
+
+    def test_grad_workspace_x_exists(self):
+        """Domain.__init__ must create _grad_workspace_x."""
+        domain = self._generic_domain()
+        self.assertTrue(hasattr(domain, '_grad_workspace_x'))
+
+    def test_grad_workspace_y_exists(self):
+        """Domain.__init__ must create _grad_workspace_y."""
+        domain = self._generic_domain()
+        self.assertTrue(hasattr(domain, '_grad_workspace_y'))
+
+    def test_phi_workspace_exists(self):
+        """Domain.__init__ must create _phi_workspace."""
+        domain = self._generic_domain()
+        self.assertTrue(hasattr(domain, '_phi_workspace'))
+
+    def test_grad_workspace_size_equals_number_of_triangles(self):
+        """Gradient workspace arrays must have length == number_of_elements."""
+        domain = self._generic_domain()
+        N = len(domain)
+        self.assertEqual(len(domain._grad_workspace_x), N)
+        self.assertEqual(len(domain._grad_workspace_y), N)
+        self.assertEqual(len(domain._phi_workspace), N)
+
+    def test_grad_workspace_initially_zero(self):
+        """Gradient workspace arrays must be initialised to zero."""
+        domain = self._generic_domain()
+        import numpy as num
+        num.testing.assert_array_equal(domain._grad_workspace_x, 0.0)
+        num.testing.assert_array_equal(domain._grad_workspace_y, 0.0)
+        num.testing.assert_array_equal(domain._phi_workspace, 0.0)
+
+    def test_grad_workspace_are_float_arrays(self):
+        """Gradient workspace arrays must be float numpy arrays."""
+        import numpy as num
+        domain = self._generic_domain()
+        self.assertEqual(domain._grad_workspace_x.dtype, float)
+        self.assertEqual(domain._grad_workspace_y.dtype, float)
+        self.assertEqual(domain._phi_workspace.dtype, float)
+
+    # ------------------------------------------------------------------
+    # Tests for get_datetime timezone fix (generic_domain.py line 762)
+    # Changed from utcfromtimestamp (deprecated) to
+    # fromtimestamp(..., timezone.utc)
+    # ------------------------------------------------------------------
+
+    def test_get_datetime_returns_string(self):
+        """get_datetime() must return a string."""
+        domain = self._generic_domain()
+        result = domain.get_datetime()
+        self.assertIsInstance(result, str)
+
+    def test_get_datetime_non_empty(self):
+        """get_datetime() must return a non-empty string."""
+        domain = self._generic_domain()
+        result = domain.get_datetime()
+        self.assertGreater(len(result), 0)
+
+    def test_get_datetime_at_epoch(self):
+        """get_datetime() at t=0 must correspond to the Unix epoch in UTC."""
+        domain = self._generic_domain()
+        domain.set_starttime(0.0)
+        result = domain.get_datetime()
+        # The Unix epoch in UTC is 1 Jan 1970.  The formatted string
+        # (from strftime('%c')) is locale-dependent but must contain '1970'.
+        self.assertIn('1970', result)
+
+    def test_get_datetime_at_known_timestamp(self):
+        """get_datetime() converts a known posix timestamp to a UTC date string."""
+        import datetime
+        domain = self._generic_domain()
+        # 2000-01-01 00:00:00 UTC = 946684800 seconds since epoch
+        ts = 946684800.0
+        domain.set_starttime(ts)
+        result = domain.get_datetime()
+        # Regardless of locale, '2000' must appear in the formatted date.
+        self.assertIn('2000', result)
+
+    # ------------------------------------------------------------------
+    # Tests for get_triangle_statistics centroid-first / None guard
+    # (generic_domain.py lines 1483-1502)
+    # ------------------------------------------------------------------
+
+    def test_get_triangle_statistics_returns_string(self):
+        """get_triangle_statistics() must return a non-empty string."""
+        domain = self._generic_domain()
+        msg = domain.get_triangle_statistics(k=0)
+        self.assertIsInstance(msg, str)
+        self.assertGreater(len(msg), 0)
+
+    def test_get_triangle_statistics_contains_centroid(self):
+        """get_triangle_statistics() must include 'centroid_value' in output."""
+        domain = self._generic_domain()
+        msg = domain.get_triangle_statistics(k=0)
+        self.assertIn('centroid_value', msg)
+
+    def test_get_triangle_statistics_centroid_before_vertices(self):
+        """centroid_value must appear before vertex_values in the statistics."""
+        domain = self._generic_domain()
+        msg = domain.get_triangle_statistics(k=0)
+        if 'vertex_values' in msg:
+            self.assertLess(msg.index('centroid_value'),
+                            msg.index('vertex_values'))
+
+    def test_get_triangle_statistics_no_edge_values_ok(self):
+        """get_triangle_statistics() must not raise when edge_values is None.
+
+        Some Quantity objects do not pre-allocate edge_values; the PR adds an
+        explicit guard so that the statistics method only prints those arrays
+        when they are available.
+        """
+        domain = self._generic_domain()
+        # Set edge_values on all quantities to None to exercise the guard.
+        for q in domain.quantities.values():
+            q.edge_values = None
+        # Should not raise
+        msg = domain.get_triangle_statistics(k=0)
+        self.assertIsInstance(msg, str)
+        # Edge values must not appear in output
+        self.assertNotIn('edge_values', msg)
+
+    def test_get_triangle_statistics_no_vertex_values_ok(self):
+        """get_triangle_statistics() must not raise when _vertex_values is None."""
+        domain = self._generic_domain()
+        for q in domain.quantities.values():
+            q._vertex_values = None
+        msg = domain.get_triangle_statistics(k=0)
+        self.assertIsInstance(msg, str)
+        self.assertNotIn('vertex_values', msg)
+
+    def test_get_triangle_statistics_all_quantities_reported(self):
+        """All quantity names must appear in the triangle statistics output."""
+        domain = self._generic_domain()
+        msg = domain.get_triangle_statistics(k=0)
+        for name in domain.quantities:
+            self.assertIn(name, msg)
+
 
 #-------------------------------------------------------------
 

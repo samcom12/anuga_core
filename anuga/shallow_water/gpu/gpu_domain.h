@@ -50,7 +50,11 @@ struct halo_exchange {
     double *host_recv_buffer;    // [3 * total_recv_size]  (GPU_AWARE_MPI only)
 
     // MPI request arrays for non-blocking communication
+    // When use_persistent == 1 these are pre-initialised persistent requests
+    // (MPI_Recv_init / MPI_Send_init) that are restarted each step with
+    // MPI_Startall instead of allocating fresh Irecv/Isend handles.
     MPI_Request *requests;       // [2 * num_neighbors] for Isend/Irecv pairs
+    int use_persistent;          // 1 if requests[] holds persistent handles
 };
 
 // Reflective boundary info - stored on GPU for efficient evaluation
@@ -365,6 +369,12 @@ struct gpu_domain {
     // These may already exist in base domain, but we track GPU copies here
     int backup_arrays_mapped;
 
+    // Fixed-timestep print flags: avoids duplicate console messages.
+    // Stored here instead of as function-local statics so multiple gpu_domain
+    // instances (e.g. future multi-domain GPU setup) do not share state.
+    int fixed_ts_printed;        // RK2 path
+    int fixed_ts_printed_rk3;   // RK3 path
+
     // FLOP counters for performance profiling (Gordon Bell)
     struct flop_counters flops;
 };
@@ -483,6 +493,18 @@ double gpu_rate_operator_apply_array(struct gpu_domain *GD, int op_id,
 
 // Ghost exchange - the key MPI function
 // Uses GPU-aware MPI if available, otherwise does D2H/H2D for small halo buffers
+//
+// Split API for computation-communication overlap:
+//   gpu_exchange_ghosts_begin: pack halo on GPU, post MPI_Irecv BEFORE D2H,
+//                              then D2H, then post MPI_Isend.
+//   gpu_exchange_ghosts_end:   MPI_Waitall + H2D + unpack on GPU.
+//
+// GPU kernels that operate only on interior/local cells (e.g. gpu_protect) can
+// be launched between begin and end to overlap with the MPI transfer.
+//
+// gpu_exchange_ghosts is a convenience wrapper: begin + end with nothing between.
+void gpu_exchange_ghosts_begin(struct gpu_domain *GD);
+void gpu_exchange_ghosts_end(struct gpu_domain *GD);
 void gpu_exchange_ghosts(struct gpu_domain *GD);
 
 // GPU kernels (stubs - will be implemented in sw_domain_gpu.c)

@@ -21,7 +21,7 @@ precision = netcdf_float # So if we want to change the precision its done here
 
 
 
-def NetCDFFile(file_name, netcdf_mode=netcdf_mode_r):
+def NetCDFFile(file_name, netcdf_mode=netcdf_mode_r, nc_format=None):
     """Wrapper to isolate changes of the netcdf libray.
 
     In theory we should be able to change over to NetCDF4 via this
@@ -38,6 +38,17 @@ def NetCDFFile(file_name, netcdf_mode=netcdf_mode_r):
         number_of_timesteps = fid.dimensions['number_of_timesteps']
         number_of_points = fid.dimensions['number_of_points']
 
+    nc_format controls the on-disk format used when creating new files
+    (netcdf_mode starting with 'w').  For read ('r') and append ('a') modes
+    nc_format is ignored and the format is determined by the existing file:
+
+        nc_format=None (default) - creates a 'NETCDF3_64BIT' file for maximum
+            compatibility with downstream tools that only support classic NetCDF.
+        nc_format='NETCDF4' - creates an HDF5-backed NETCDF4 file that supports
+            per-variable zlib compression (pass zlib=True, complevel=N to
+            createVariable) and files larger than 2 GB.
+        nc_format='NETCDF4_CLASSIC' - NETCDF4 HDF5 backend with the classic
+            data model (no groups, unlimited dimensions only in first position).
     """
 
     using_scientific = using_netcdf4 = False
@@ -55,8 +66,10 @@ def NetCDFFile(file_name, netcdf_mode=netcdf_mode_r):
         return NetCDFFile(file_name, netcdf_mode)
 
     if using_netcdf4:
-        if netcdf_mode == 'wl' :
+        if netcdf_mode == 'wl':
             return Dataset(file_name, 'w', format='NETCDF3_64BIT')
+        elif netcdf_mode[0] == 'w' and nc_format is not None:
+            return Dataset(file_name, netcdf_mode, format=nc_format)
         else:
             return Dataset(file_name, netcdf_mode, format='NETCDF3_64BIT')
 

@@ -2,7 +2,7 @@
 //
 // These functions use OpenMP parallel loops that compile to:
 // - CPU multicore: #pragma omp parallel for simd (when -DCPU_ONLY_MODE)
-// - GPU offload: #pragma omp target teams loop (otherwise)
+// - GPU offload: #pragma omp target teams distribute parallel for simd (otherwise)
 //
 // Both sw_domain_openmp_ext and sw_domain_gpu_ext use these same kernels.
 
@@ -397,10 +397,12 @@ void core_update_conserved_quantities(struct domain *D, double timestep) {
         double xmom_c = xmom_cv[k];
         double ymom_c = ymom_cv[k];
 
-        // Normalize semi-implicit update by centroid value
-        double stage_si = (stage_c == 0.0) ? 0.0 : stage_siu[k] / stage_c;
-        double xmom_si = (xmom_c == 0.0) ? 0.0 : xmom_siu[k] / xmom_c;
-        double ymom_si = (ymom_c == 0.0) ? 0.0 : ymom_siu[k] / ymom_c;
+        // Normalize semi-implicit update by centroid value.
+        // Use a tiny epsilon instead of exact floating-point equality to avoid
+        // a divergent branch on GPU (most threads have non-zero values).
+        double stage_si = (fabs(stage_c) > 1.0e-100) ? stage_siu[k] / stage_c : 0.0;
+        double xmom_si  = (fabs(xmom_c)  > 1.0e-100) ? xmom_siu[k]  / xmom_c  : 0.0;
+        double ymom_si  = (fabs(ymom_c)  > 1.0e-100) ? ymom_siu[k]  / ymom_c  : 0.0;
 
         // Apply explicit updates
         stage_cv[k] += timestep * stage_eu[k];
@@ -459,30 +461,31 @@ void core_saxpy_conserved_quantities(struct domain *D, double a, double b, doubl
     double * restrict stage_cv = D->stage_centroid_values;
     double * restrict xmom_cv = D->xmom_centroid_values;
     double * restrict ymom_cv = D->ymom_centroid_values;
+    double * restrict bed_cv = D->bed_centroid_values;
+    double * restrict height_cv = D->height_centroid_values;
 
     double * restrict stage_bk = D->stage_backup_values;
     double * restrict xmom_bk = D->xmom_backup_values;
     double * restrict ymom_bk = D->ymom_backup_values;
 
-    // Standard SAXPY: Q = a*Q + b*Q_backup
+    // Pre-compute the reciprocal of c so we can fold the optional scaling step
+    // into the SAXPY loop, eliminating a second GPU kernel launch for RK3.
+    // When c == 0.0 (RK2 path) or c == 1.0 (no scaling needed), c_inv = 1.0.
+    double c_inv = (c != 0.0 && c != 1.0) ? 1.0 / c : 1.0;
+
+    // Fused SAXPY + optional scale + height update in a single GPU kernel pass.
+    // This replaces the previous two-pass approach (separate scaling loop) and
+    // also incorporates the height update previously done in gpu_kernels.c,
+    // saving up to two extra kernel launches per RK step.
     OMP_PARALLEL_LOOP
     for (anuga_int k = 0; k < n; k++) {
-        stage_cv[k] = a * stage_cv[k] + b * stage_bk[k];
-        xmom_cv[k] = a * xmom_cv[k] + b * xmom_bk[k];
-        ymom_cv[k] = a * ymom_cv[k] + b * ymom_bk[k];
-    }
-
-    // Apply c scaling if needed: Q = Q / c
-    // Used for numerical stability with RK coefficients like a=1/3, b=2/3
-    // Skip if c=0.0 (RK2 passes 0.0) or c=1.0 (no scaling needed)
-    if (c != 1.0 && c != 0.0) {
-        double c_inv = 1.0 / c;
-        OMP_PARALLEL_LOOP
-        for (anuga_int k = 0; k < n; k++) {
-            stage_cv[k] *= c_inv;
-            xmom_cv[k] *= c_inv;
-            ymom_cv[k] *= c_inv;
-        }
+        double s = (a * stage_cv[k] + b * stage_bk[k]) * c_inv;
+        double x = (a * xmom_cv[k]  + b * xmom_bk[k])  * c_inv;
+        double y = (a * ymom_cv[k]  + b * ymom_bk[k])  * c_inv;
+        stage_cv[k]  = s;
+        xmom_cv[k]   = x;
+        ymom_cv[k]   = y;
+        height_cv[k] = fmax(s - bed_cv[k], 0.0);
     }
 }
 
@@ -498,10 +501,14 @@ double core_protect(struct domain *D) {
     double * restrict xmom_cv = D->xmom_centroid_values;
     double * restrict ymom_cv = D->ymom_centroid_values;
     double * restrict bed_cv = D->bed_centroid_values;
+    double * restrict height_cv = D->height_centroid_values;
     double * restrict areas = D->areas;
 
     double mass_error = 0.0;
 
+    // Fused loop: protect + height update in one GPU kernel pass.
+    // Previously the height recompute was a separate kernel in gpu_kernels.c;
+    // inlining it here saves one extra kernel launch per protect call.
     OMP_PARALLEL_LOOP_REDUCTION_PLUS(mass_error)
     for (anuga_int k = 0; k < n; k++) {
         double h = stage_cv[k] - bed_cv[k];
@@ -516,7 +523,11 @@ double core_protect(struct domain *D) {
             // Negative depth - track mass error and set stage to bed
             mass_error += (-h) * areas[k];
             stage_cv[k] = bed_cv[k];
+            h = 0.0;
         }
+
+        // Update height inline (avoids a separate kernel launch)
+        height_cv[k] = h;
     }
 
     return mass_error;

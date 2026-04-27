@@ -115,7 +115,7 @@ from anuga.config import LOW_FROUDE_OFF, LOW_FROUDE_1, LOW_FROUDE_2
 
 from anuga.shallow_water.forcing import Cross_section
 from anuga.utilities.numerical_tools import mean
-from anuga.file.sww import SWW_file
+from anuga.file.sww import SWW_file, Parallel_SWW_file
 
 import anuga.utilities.log as log
 
@@ -2581,6 +2581,11 @@ class Domain(Generic_Domain):
         #nvtx marker
         nvtxRangePop()
 
+        # Ensure any pending async SWW write finishes before returning.
+        if self.store and hasattr(self, 'writer') and self.writer is not None:
+            if hasattr(self.writer, 'close'):
+                self.writer.close()
+
 
     def initialise_storage(self):
         """Create and initialise self.writer object for storing data.
@@ -2589,8 +2594,14 @@ class Domain(Generic_Domain):
 
         nvtxRangePush('SWW_file')
 
-        # Initialise writer
-        self.writer = SWW_file(self)
+        # Initialise writer — use parallel MPI-IO writer when requested and
+        # the domain is a parallel (multi-rank) domain.
+        if (getattr(self, 'sww_parallel_write', False)
+                and getattr(self, 'parallel', False)
+                and getattr(self, 'numproc', 1) > 1):
+            self.writer = Parallel_SWW_file(self)
+        else:
+            self.writer = SWW_file(self)
 
         # Store vertices and connectivity
         self.writer.store_connectivity()

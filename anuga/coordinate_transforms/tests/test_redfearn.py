@@ -536,6 +536,145 @@ class TestCase(unittest.TestCase):
 
 #-------------------------------------------------------------
 
+
+class Test_epsg_conversions(unittest.TestCase):
+    """Tests for epsg_to_ll and ll_to_epsg added in this PR.
+
+    These functions wrap pyproj.Transformer and were newly exported from
+    anuga.coordinate_transforms.redfearn (and re-exported from anuga.__init__).
+    """
+
+    def _skip_if_no_pyproj(self):
+        try:
+            import pyproj  # noqa: F401
+        except ImportError:
+            self.skipTest('pyproj not available')
+
+    # ------------------------------------------------------------------
+    # epsg_to_ll
+    # ------------------------------------------------------------------
+
+    def test_epsg_to_ll_scalar_utm_zone55s(self):
+        """Single UTM easting/northing → lat/lon (EPSG:32755 = UTM zone 55S)."""
+        self._skip_if_no_pyproj()
+        from anuga.coordinate_transforms.redfearn import epsg_to_ll
+        # Known point: Sydney Opera House ≈ (151.215E, -33.857S)
+        easting = 334111.0
+        northing = 6251099.0
+        epsg = 32755  # WGS 84 / UTM zone 55S
+        lat, lon = epsg_to_ll(easting, northing, epsg)
+        self.assertAlmostEqual(float(lat), -33.857, delta=0.01)
+        self.assertAlmostEqual(float(lon), 151.215, delta=0.01)
+
+    def test_epsg_to_ll_array_utm_zone55s(self):
+        """Array of UTM coordinates → lat/lon arrays."""
+        self._skip_if_no_pyproj()
+        from anuga.coordinate_transforms.redfearn import epsg_to_ll
+        easting = num.array([334111.0, 334111.0])
+        northing = num.array([6251099.0, 6251099.0])
+        epsg = 32755
+        lat, lon = epsg_to_ll(easting, northing, epsg)
+        self.assertEqual(lat.shape, (2,))
+        self.assertEqual(lon.shape, (2,))
+        num.testing.assert_allclose(lat, lat[0])  # both same point
+        num.testing.assert_allclose(lon, lon[0])
+
+    def test_epsg_to_ll_returns_ndarrays(self):
+        """epsg_to_ll always returns numpy arrays regardless of scalar input."""
+        self._skip_if_no_pyproj()
+        from anuga.coordinate_transforms.redfearn import epsg_to_ll
+        lat, lon = epsg_to_ll(334111.0, 6251099.0, 32755)
+        self.assertIsInstance(lat, num.ndarray)
+        self.assertIsInstance(lon, num.ndarray)
+
+    # ------------------------------------------------------------------
+    # ll_to_epsg
+    # ------------------------------------------------------------------
+
+    def test_ll_to_epsg_scalar_utm_zone55s(self):
+        """Single lat/lon → UTM easting/northing (EPSG:32755)."""
+        self._skip_if_no_pyproj()
+        from anuga.coordinate_transforms.redfearn import ll_to_epsg
+        lat = -33.857
+        lon = 151.215
+        epsg = 32755
+        easting, northing = ll_to_epsg(lat, lon, epsg)
+        self.assertAlmostEqual(float(easting), 334111.0, delta=10.0)
+        self.assertAlmostEqual(float(northing), 6251099.0, delta=10.0)
+
+    def test_ll_to_epsg_array_utm_zone55s(self):
+        """Array of lat/lon coordinates → UTM easting/northing arrays."""
+        self._skip_if_no_pyproj()
+        from anuga.coordinate_transforms.redfearn import ll_to_epsg
+        lat = num.array([-33.857, -33.857])
+        lon = num.array([151.215, 151.215])
+        epsg = 32755
+        easting, northing = ll_to_epsg(lat, lon, epsg)
+        self.assertEqual(easting.shape, (2,))
+        self.assertEqual(northing.shape, (2,))
+
+    def test_ll_to_epsg_returns_ndarrays(self):
+        """ll_to_epsg always returns numpy arrays."""
+        self._skip_if_no_pyproj()
+        from anuga.coordinate_transforms.redfearn import ll_to_epsg
+        easting, northing = ll_to_epsg(-33.857, 151.215, 32755)
+        self.assertIsInstance(easting, num.ndarray)
+        self.assertIsInstance(northing, num.ndarray)
+
+    # ------------------------------------------------------------------
+    # Round-trip
+    # ------------------------------------------------------------------
+
+    def test_epsg_ll_roundtrip_scalar(self):
+        """ll_to_epsg followed by epsg_to_ll recovers original coordinates."""
+        self._skip_if_no_pyproj()
+        from anuga.coordinate_transforms.redfearn import epsg_to_ll, ll_to_epsg
+        lat0, lon0 = -33.857, 151.215
+        epsg = 32755
+        e, n = ll_to_epsg(lat0, lon0, epsg)
+        lat1, lon1 = epsg_to_ll(e, n, epsg)
+        self.assertAlmostEqual(float(lat1), lat0, delta=1e-5)
+        self.assertAlmostEqual(float(lon1), lon0, delta=1e-5)
+
+    def test_epsg_ll_roundtrip_array(self):
+        """Array round-trip for ll_to_epsg / epsg_to_ll."""
+        self._skip_if_no_pyproj()
+        from anuga.coordinate_transforms.redfearn import epsg_to_ll, ll_to_epsg
+        lat0 = num.array([-33.857, -34.5, -35.0])
+        lon0 = num.array([151.215, 150.9, 149.5])
+        epsg = 32755
+        e, n = ll_to_epsg(lat0, lon0, epsg)
+        lat1, lon1 = epsg_to_ll(e, n, epsg)
+        num.testing.assert_allclose(lat1, lat0, atol=1e-5)
+        num.testing.assert_allclose(lon1, lon0, atol=1e-5)
+
+    # ------------------------------------------------------------------
+    # Exported from anuga.__init__
+    # ------------------------------------------------------------------
+
+    def test_anuga_init_exports_epsg_to_ll(self):
+        """epsg_to_ll is importable directly from anuga."""
+        import anuga
+        self.assertTrue(hasattr(anuga, 'epsg_to_ll'))
+
+    def test_anuga_init_exports_ll_to_epsg(self):
+        """ll_to_epsg is importable directly from anuga."""
+        import anuga
+        self.assertTrue(hasattr(anuga, 'll_to_epsg'))
+
+    def test_anuga_all_contains_epsg_to_ll(self):
+        """epsg_to_ll appears in anuga.__all__."""
+        import anuga
+        self.assertIn('epsg_to_ll', anuga.__all__)
+
+    def test_anuga_all_contains_ll_to_epsg(self):
+        """ll_to_epsg appears in anuga.__all__."""
+        import anuga
+        self.assertIn('ll_to_epsg', anuga.__all__)
+
+
+#-------------------------------------------------------------
+
 if __name__ == "__main__":
     suite = unittest.TestLoader().loadTestsFromTestCase(TestCase)
     runner = unittest.TextTestRunner()

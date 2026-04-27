@@ -3,6 +3,8 @@
 
 import numpy
 import numpy as num
+import threading
+import concurrent.futures
 from anuga.utilities.file_utils import create_filename
 from anuga.coordinate_transforms.geo_reference import \
     ensure_geo_reference
@@ -109,6 +111,18 @@ class SWW_file(Data_format):
         else:
             self.timezone = 'UTC'
 
+        # zlib compression for dynamic variables (requires NETCDF4 format)
+        self.zlib_compression = bool(getattr(domain, 'sww_zlib_compression', False))
+        self.zlib_complevel = int(getattr(domain, 'sww_zlib_complevel', 4))
+        self._nc_format = 'NETCDF4' if self.zlib_compression else None
+
+        # Async write: collect data synchronously, write in background thread
+        self.async_write = bool(getattr(domain, 'sww_async_write', False))
+        self._write_executor = None
+        self._pending_future = None
+        if self.async_write:
+            self._write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
 
         # Call parent constructor
         Data_format.__init__(self, domain, 'sww', mode)
@@ -138,7 +152,7 @@ class SWW_file(Data_format):
                     dynamic_c_quantities.append(q+'_c')
 
         # NetCDF file definition
-        fid = NetCDFFile(self.filename, mode)
+        fid = NetCDFFile(self.filename, mode, nc_format=self._nc_format)
         if mode[0] == 'w':
             description = 'Output from anuga.file.sww ' \
                           'suitable for plotting'
@@ -157,7 +171,9 @@ class SWW_file(Data_format):
                                      smoothing=domain.smooth,
                                      order=domain.default_order,
                                      sww_precision=self.precision,
-                                     timezone=self.timezone)
+                                     timezone=self.timezone,
+                                     zlib=self.zlib_compression,
+                                     complevel=self.zlib_complevel)
 
             # Extra optional information
             if hasattr(domain, 'texture'):
@@ -258,23 +274,59 @@ class SWW_file(Data_format):
         fid.close()
 
     def store_timestep(self):
-        """Store time and time dependent quantities
+        """Store time and time dependent quantities.
+
+        When ``async_write`` is enabled (set via ``domain.sww_async_write =
+        True``), quantity data is collected synchronously from the domain and
+        then written to the NetCDF file in a background thread, allowing the
+        simulation to continue computing while the IO is in progress.
         """
 
-        #import types
+        # Wait for any previously submitted async write to complete before
+        # collecting new data.  Any exception raised by the background write
+        # is re-raised here at the next timestep so it is visible to the caller.
+        if self.async_write and self._pending_future is not None:
+            try:
+                self._pending_future.result()
+            except Exception as exc:
+                raise RuntimeError(
+                    'Async SWW write failed for file %s: %s' % (self.filename, exc)
+                ) from exc
+            finally:
+                self._pending_future = None
+
+        # Collect all data needed for this timestep synchronously so that
+        # the domain can safely advance before the file write completes.
+        snapshot = self._collect_timestep_snapshot()
+        if snapshot is None:
+            # Recursion case already handled inside _collect_timestep_snapshot
+            return
+
+        if self.async_write:
+            self._pending_future = self._write_executor.submit(
+                self._write_timestep_snapshot, snapshot)
+        else:
+            self._write_timestep_snapshot(snapshot)
+
+    def _collect_timestep_snapshot(self):
+        """Collect a snapshot of all data required for the current timestep.
+
+        Returns a dict ready to pass to ``_write_timestep_snapshot``, or
+        ``None`` if the file-size recursion path was taken (which writes
+        synchronously internally and needs no further action).
+        """
+
         from time import sleep
         from os import stat
 
-        # Get NetCDF
+        # Open the file to check size and read the current time length.
         retries = 0
         file_open = False
+        fid = None
         while not file_open and retries < 10:
             try:
-                # Open existing file
                 fid = NetCDFFile(self.filename, netcdf_mode_a)
             except OSError:
-                # This could happen if someone was reading the file.
-                # In that case, wait a while and try again
                 msg = 'Warning (store_timestep): File %s could not be opened' \
                       % self.filename
                 msg += ' - trying step %s again' % self.domain.relative_time
@@ -289,148 +341,605 @@ class SWW_file(Data_format):
             raise DataFileNotOpenError(msg)
 
         # Check to see if the file is already too big:
-        time = fid.variables['time'][:]
-
-        i = len(time) + 1
+        time_len = fid.variables['time'].shape[0]
+        i = time_len + 1
         file_size = stat(self.filename)[6]
-        file_size_increase = file_size//i
-        if file_size + file_size_increase > self.max_size * 2**self.recursion:
-            # In order to get the file name and start time correct,
-            # I change the domain.filename and domain.starttime.
-            # This is the only way to do this without changing
-            # other modules (I think).
+        file_size_increase = file_size // i
+        fid.close()
 
-            # Write a filename addon that won't break the anuga viewers
-            # (10.sww is bad)
+        if file_size + file_size_increase > self.max_size * 2**self.recursion:
+            # File too large — create a new SWW file synchronously (rare path).
             filename_ext = '_time_%s' % self.domain.relative_time
             filename_ext = filename_ext.replace('.', '_')
-
-            # Remember the old filename, then give domain a
-            # name with the extension
             old_domain_filename = self.domain.get_name()
             if not self.recursion:
                 self.domain.set_name(old_domain_filename + filename_ext)
-
-            # Temporarily change the domain starttime to the current time
             old_domain_starttime = self.domain.starttime
             self.domain.starttime = self.domain.get_time()
-
-            # Build a new data_structure.
             next_data_structure = SWW_file(self.domain, mode=self.mode,
                                            max_size=self.max_size,
-                                           recursion=self.recursion+1)
+                                           recursion=self.recursion + 1)
             if not self.recursion:
                 log.info('    file_size = %s' % file_size)
                 log.info('    saving file to %s'
-                             % next_data_structure.filename)
-
-            # Set up the new data_structure
+                         % next_data_structure.filename)
             self.domain.writer = next_data_structure
-
-            # Store connectivity and first timestep
             next_data_structure.store_connectivity()
             next_data_structure.store_timestep()
-            fid.sync()
-            fid.close()
-
-            # Restore the old starttime and filename
+            # Restore
             self.domain.starttime = old_domain_starttime
             self.domain.set_name(old_domain_filename)
-        else:
-            self.recursion = False
-            domain = self.domain
+            return None  # Handled; caller should not write further.
 
-            # Get the variables
-            time = fid.variables['time'][:]
-            i = len(time)
+        # Normal path: collect all data from the domain now (synchronously).
+        self.recursion = False
+        domain = self.domain
+        relative_time = domain.relative_time
 
-            if 'stage' in self.writer.dynamic_quantities:
-                # Select only those values for stage,
-                # xmomentum and ymomentum (if stored) where
-                # depth exceeds minimum_storable_height
-                #
-                # In this branch it is assumed that elevation
-                # is also available as a quantity
+        z = None
+        storable_indices = None
+        if 'stage' in self.writer.dynamic_quantities:
+            Q = domain.quantities['stage']
+            w, _ = Q.get_vertex_values(xy=False)
+            Q = domain.quantities['elevation']
+            z, _ = Q.get_vertex_values(xy=False)
+            storable_indices = num.array(w - z >= self.minimum_storable_height)
 
-                # Smoothing for the get_vertex_values will be obtained
-                # from the smooth setting in domain
+        dynamic_quantities = {}
+        for name in self.writer.dynamic_quantities:
+            Q = domain.quantities[name]
+            # get_vertex_values returns a newly allocated array, so no explicit
+            # copy is needed here for thread safety.
+            A, _ = Q.get_vertex_values(xy=False, precision=self.precision)
+            if storable_indices is not None:
+                if name == 'stage':
+                    A = num.choose(storable_indices, (z, A))
+                if name in ['xmomentum', 'ymomentum']:
+                    null = num.zeros(num.size(A), A.dtype.char)
+                    A = num.choose(storable_indices, (null, A))
+            dynamic_quantities[name] = A
 
-                Q = domain.quantities['stage']
-                w, _ = Q.get_vertex_values(xy=False)
+        dynamic_quantities_centroid = {}
+        for name in self.writer.dynamic_c_quantities:
+            Q = domain.quantities[name[:-2]]
+            # centroid_values is a live array — take a copy so the background
+            # thread sees the values at *this* timestep even after the domain
+            # advances.
+            dynamic_quantities_centroid[name] = Q.centroid_values.copy()
 
-                Q = domain.quantities['elevation']
-                z, _ = Q.get_vertex_values(xy=False)
+        # Snapshot the extrema (monitored quantities) if needed.
+        extrema_snapshot = None
+        if domain.quantities_to_be_monitored is not None:
+            extrema_snapshot = {}
+            for q, info in domain.quantities_to_be_monitored.items():
+                extrema_snapshot[q] = {
+                    'min': info['min'],
+                    'min_location': (info['min_location'].copy()
+                                     if info['min_location'] is not None else None),
+                    'min_time': info['min_time'],
+                    'max': info['max'],
+                    'max_location': (info['max_location'].copy()
+                                     if info['max_location'] is not None else None),
+                    'max_time': info['max_time'],
+                }
 
-                storable_indices = num.array(
-                    w-z >= self.minimum_storable_height)
+        return {
+            'filename': self.filename,
+            'relative_time': relative_time,
+            'precision': self.precision,
+            'dynamic_quantities': dynamic_quantities,
+            'dynamic_quantities_centroid': dynamic_quantities_centroid,
+            'store_centroids': self.store_centroids,
+            'extrema_snapshot': extrema_snapshot,
+            'writer': self.writer,
+        }
 
-                # print numpy.sum(storable_indices), len(z), self.minimum_storable_height, numpy.min(w-z)
+    def _write_timestep_snapshot(self, snapshot):
+        """Write a previously collected snapshot to the NetCDF file.
+
+        This method is safe to call from a background thread because it only
+        uses data already captured in *snapshot* — it does not touch the domain.
+        """
+
+        from time import sleep
+
+        filename = snapshot['filename']
+        retries = 0
+        file_open = False
+        fid = None
+        while not file_open and retries < 10:
+            try:
+                fid = NetCDFFile(filename, netcdf_mode_a)
+            except OSError:
+                msg = 'Warning (_write_timestep_snapshot): File %s could not be opened' \
+                      % filename
+                log.info(msg)
+                retries += 1
+                sleep(1)
             else:
-                # Very unlikely branch
-                storable_indices = None  # This means take all
+                file_open = True
 
-            # Now store dynamic quantities
-            dynamic_quantities = {}
-            dynamic_quantities_centroid = {}
+        if not file_open:
+            raise DataFileNotOpenError(
+                'File %s could not be opened for append' % filename)
 
-            for name in self.writer.dynamic_quantities:
-                #netcdf_array = fid.variables[name]
+        writer = snapshot['writer']
+        slice_index = writer.store_quantities(
+            fid,
+            time=snapshot['relative_time'],
+            sww_precision=snapshot['precision'],
+            **snapshot['dynamic_quantities'])
 
-                Q = domain.quantities[name]
-                A, _ = Q.get_vertex_values(xy=False,
-                                           precision=self.precision)
+        if snapshot['store_centroids']:
+            writer.store_quantities_centroid(
+                fid,
+                slice_index=slice_index,
+                sww_precision=snapshot['precision'],
+                **snapshot['dynamic_quantities_centroid'])
 
-                if storable_indices is not None:
-                    if name == 'stage':
-                        A = num.choose(storable_indices, (z, A))
+        if snapshot['extrema_snapshot'] is not None:
+            for q, info in snapshot['extrema_snapshot'].items():
+                if info['min'] is not None:
+                    fid.variables[q + '.extrema'][0] = info['min']
+                    fid.variables[q + '.min_location'][:] = info['min_location']
+                    fid.variables[q + '.min_time'][0] = info['min_time']
+                if info['max'] is not None:
+                    fid.variables[q + '.extrema'][1] = info['max']
+                    fid.variables[q + '.max_location'][:] = info['max_location']
+                    fid.variables[q + '.max_time'][0] = info['max_time']
 
-                    if name in ['xmomentum', 'ymomentum']:
-                        # Get xmomentum where depth exceeds
-                        # minimum_storable_height
+        fid.close()
 
-                        # Define a zero vector of same size and type as A
-                        # for use with momenta
-                        null = num.zeros(num.size(A), A.dtype.char)
-                        A = num.choose(storable_indices, (null, A))
+    def wait_for_pending_write(self):
+        """Block until any background write submitted by the async path completes.
 
-                dynamic_quantities[name] = A
+        Raises RuntimeError if the background write encountered an exception,
+        so the caller is notified of any IO failure.
+        """
 
-            for name in self.writer.dynamic_c_quantities:
-                Q = domain.quantities[name[:-2]]
-                dynamic_quantities_centroid[name] = Q.centroid_values
+        if self._pending_future is not None:
+            try:
+                self._pending_future.result()
+            except Exception as exc:
+                raise RuntimeError(
+                    'Async SWW write failed for file %s: %s' % (self.filename, exc)
+                ) from exc
+            finally:
+                self._pending_future = None
 
-            # Store dynamic quantities
-            slice_index = self.writer.store_quantities(fid,
-                                                       time=self.domain.relative_time,
-                                                       sww_precision=self.precision,
-                                                       **dynamic_quantities)
+    def close(self):
+        """Flush any pending async write and shut down the background executor.
 
-            # Store dynamic quantities
-            if self.store_centroids:
-                self.writer.store_quantities_centroid(fid,
-                                                      slice_index=slice_index,
-                                                      sww_precision=self.precision,
-                                                      **dynamic_quantities_centroid)
+        Call this explicitly after the last ``store_timestep`` to guarantee
+        all data is written to disk before continuing.  This is also called
+        automatically from ``__del__``, but explicit calls are preferred.
+        """
 
-            # Update extrema if requested
-            domain = self.domain
-            if domain.quantities_to_be_monitored is not None:
-                for q, info in list(domain.quantities_to_be_monitored.items()):
-                    if info['min'] is not None:
-                        fid.variables[q + '.extrema'][0] = info['min']
-                        fid.variables[q + '.min_location'][:] = \
-                            info['min_location']
-                        fid.variables[q + '.min_time'][0] = info['min_time']
+        self.wait_for_pending_write()
+        if self._write_executor is not None:
+            self._write_executor.shutdown(wait=True)
+            self._write_executor = None
 
-                    if info['max'] is not None:
-                        fid.variables[q + '.extrema'][1] = info['max']
-                        fid.variables[q + '.max_location'][:] = \
-                            info['max_location']
-                        fid.variables[q + '.max_time'][0] = info['max_time']
+    def __del__(self):
+        """Ensure any pending async write finishes before the object is garbage-collected."""
 
-            # Flush and close
-            # fid.sync()
-            fid.close()
+        try:
+            self.close()
+        except Exception as exc:
+            log.info('SWW_file.__del__: error during async write cleanup: %s' % exc)
+
+
+class Parallel_SWW_file:
+    """Parallel NetCDF MPI-IO writer for SWW files.
+
+    All MPI ranks write collectively to a single shared .sww file using
+    netCDF4 parallel I/O (HDF5 backend).  This eliminates the post-run
+    ``sww_merge`` step and improves write throughput on parallel filesystems.
+
+    Requires
+    --------
+    * ``netCDF4`` built with parallel HDF5 support
+      (``nc-config --has-parallel4`` should print ``yes``).
+    * ``mpi4py`` installed.
+    * The domain must have ``tri_l2g``, ``node_l2g``, ``tri_full_flag``,
+      ``number_of_global_triangles``, and ``number_of_global_nodes``
+      attributes (all present on ``Parallel_domain`` instances).
+
+    Usage
+    -----
+    Set ``domain.sww_parallel_write = True`` before the evolve loop::
+
+        domain.sww_parallel_write = True
+        for t in domain.evolve(yieldstep=10, finaltime=100):
+            ...
+        # No sww_merge() call needed — the single shared file is complete.
+
+    Only smooth-mesh mode (``domain.smooth = True``, the default for
+    parallel domains) is supported.
+    """
+
+    def __init__(self, domain, mode=netcdf_mode_w, max_size=None,
+                 recursion=False):
+        try:
+            from mpi4py import MPI
+            from netCDF4 import Dataset  # noqa: F401 — verify import works
+        except ImportError as exc:
+            raise ImportError(
+                "Parallel_SWW_file requires mpi4py and netCDF4 with "
+                "parallel HDF5 support.  Error: %s" % exc
+            ) from exc
+
+        from mpi4py import MPI
+
+        self._MPI = MPI
+        self._comm = MPI.COMM_WORLD
+        self._rank = domain.processor
+        self._nprocs = domain.numproc
+
+        # Local-to-global index maps (set by Parallel_domain constructor)
+        self._tri_l2g = domain.tri_l2g
+        self._node_l2g = domain.node_l2g
+        self._tri_full_flag = domain.tri_full_flag
+        self._n_global_triangles = domain.number_of_global_triangles
+        self._n_global_nodes = domain.number_of_global_nodes
+
+        self.precision = netcdf_float32
+        self.domain = domain
+        self._timestep_count = 0
+
+        # Compression (requires NETCDF4 format — already enforced here)
+        self.zlib_compression = bool(getattr(domain, 'sww_zlib_compression', False))
+        self.zlib_complevel = int(getattr(domain, 'sww_zlib_complevel', 4))
+
+        # Centroid storage
+        self.store_centroids = bool(getattr(domain, 'store_centroids', False))
+
+        # Minimum storable height
+        if hasattr(domain, 'minimum_storable_height'):
+            self.minimum_storable_height = domain.minimum_storable_height
+        else:
+            self.minimum_storable_height = default_minimum_storable_height
+
+        # Shared filename: uses the global (non-rank-specific) name
+        self.filename = create_filename(
+            domain.get_datadir(), domain.get_global_name(), 'sww')
+
+        # Classify stored quantities
+        static_quantities = []
+        dynamic_quantities = []
+        static_c_quantities = []
+        dynamic_c_quantities = []
+
+        if not domain.smooth:
+            raise ValueError(
+                "Parallel_SWW_file only supports smooth-mesh mode "
+                "(domain.smooth=True).  Non-smooth (unique-vertex) mode "
+                "is not yet implemented for parallel MPI-IO.")
+
+        for q in domain.quantities_to_be_stored:
+            flag = domain.quantities_to_be_stored[q]
+            assert q in domain.quantities, \
+                'Quantity %s not in domain.quantities' % q
+            assert flag in [1, 2]
+            if flag == 1:
+                static_quantities.append(q)
+                if self.store_centroids:
+                    static_c_quantities.append(q + '_c')
+            if flag == 2:
+                dynamic_quantities.append(q)
+                if self.store_centroids:
+                    dynamic_c_quantities.append(q + '_c')
+
+        self.static_quantities = static_quantities
+        self.dynamic_quantities = dynamic_quantities
+        self.static_c_quantities = static_c_quantities
+        self.dynamic_c_quantities = dynamic_c_quantities
+
+        # Create the file (all ranks participate collectively)
+        if mode[0] == 'w':
+            self._create_file_header(domain)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _open(self, mode='r+'):
+        """Open the shared NetCDF file in parallel mode (collective)."""
+        from mpi4py import MPI
+        from netCDF4 import Dataset
+
+        try:
+            fid = Dataset(
+                self.filename, mode, format='NETCDF4',
+                parallel=True, comm=self._comm, info=MPI.Info())
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to open '%s' in parallel netCDF4 mode.  "
+                "Ensure netCDF4 was compiled with parallel HDF5 support "
+                "(nc-config --has-parallel4 should print 'yes').  "
+                "Error: %s" % (self.filename, exc)
+            ) from exc
+        return fid
+
+    def _full_nodes_of_rank(self, V):
+        """Return (fl_nodes, g_full_nodes) for this rank's full triangles.
+
+        Parameters
+        ----------
+        V : ndarray, shape (n_local_tris, 3)
+            Local vertex-index connectivity array.
+
+        Returns
+        -------
+        fl_nodes : ndarray of int
+            Unique local node indices that belong to at least one full tri.
+        g_full_nodes : ndarray of int
+            Corresponding global node indices (``node_l2g[fl_nodes]``).
+        """
+        full_mask = self._tri_full_flag > 0
+        V_full = V[full_mask].astype(int)
+        if V_full.size > 0:
+            fl_nodes = num.unique(V_full)
+            g_full_nodes = self._node_l2g[fl_nodes]
+        else:
+            fl_nodes = num.array([], dtype=int)
+            g_full_nodes = num.array([], dtype=int)
+        return fl_nodes, g_full_nodes
+
+    # ------------------------------------------------------------------
+    # File creation
+    # ------------------------------------------------------------------
+
+    def _create_file_header(self, domain):
+        """Create the NETCDF4 file with global dimensions (collective)."""
+        fid = self._open('w')
+
+        # --- Global metadata ---
+        fid.institution = getattr(domain, 'institution', default_institution)
+        fid.description = 'Output from anuga.file.sww suitable for plotting'
+
+        if domain.smooth:
+            fid.smoothing = 'Yes'
+            fid.vertices_are_stored_uniquely = 'False'
+        else:
+            fid.smoothing = 'No'
+            fid.vertices_are_stored_uniquely = 'True'
+
+        fid.order = domain.default_order
+        fid.starttime = float(domain.starttime)
+        fid.timezone = str(getattr(domain, 'timezone', 'UTC'))
+
+        from anuga import get_revision_number, get_revision_date, get_version
+        try:
+            fid.revision_number = str(get_revision_number())
+        except Exception:
+            fid.revision_number = 'None'
+        try:
+            fid.revision_date = str(get_revision_date())
+        except Exception:
+            fid.revision_date = 'None'
+        try:
+            fid.anuga_version = str(get_version())
+        except Exception:
+            fid.anuga_version = 'None'
+
+        # Geo-reference attributes (xllcorner, yllcorner, zone, …)
+        domain.geo_reference.write_NetCDF(fid)
+
+        # --- Dimensions ---
+        fid.createDimension('number_of_volumes', self._n_global_triangles)
+        fid.createDimension('number_of_triangle_vertices',
+                            self._n_global_nodes)
+        fid.createDimension('number_of_vertices', 3)
+        fid.createDimension('numbers_in_range', 2)
+        fid.createDimension('number_of_points', self._n_global_nodes)
+        fid.createDimension('number_of_timesteps', None)   # unlimited
+
+        # --- Static geometry variables ---
+        fid.createVariable('x', self.precision, ('number_of_points',))
+        fid.createVariable('y', self.precision, ('number_of_points',))
+        fid.createVariable('volumes', netcdf_int,
+                           ('number_of_volumes', 'number_of_vertices'))
+
+        for q in self.static_quantities:
+            fid.createVariable(q, self.precision, ('number_of_points',))
+            v = fid.createVariable(q + '_range', self.precision,
+                                   ('numbers_in_range',))
+            v[0] = max_float
+            v[1] = -max_float
+
+        for q in self.static_c_quantities:
+            fid.createVariable(q, self.precision, ('number_of_volumes',))
+
+        # --- Dynamic variables ---
+        compress_kwargs = {}
+        if self.zlib_compression:
+            compress_kwargs = {'zlib': True, 'complevel': self.zlib_complevel}
+
+        for q in self.dynamic_quantities:
+            var = fid.createVariable(
+                q, self.precision,
+                ('number_of_timesteps', 'number_of_points'),
+                **compress_kwargs)
+            var.set_collective(True)   # collective I/O for unlimited dim
+            v = fid.createVariable(q + '_range', self.precision,
+                                   ('numbers_in_range',))
+            v[0] = max_float
+            v[1] = -max_float
+
+        for q in self.dynamic_c_quantities:
+            var = fid.createVariable(
+                q, self.precision,
+                ('number_of_timesteps', 'number_of_volumes'),
+                **compress_kwargs)
+            var.set_collective(True)
+
+        time_var = fid.createVariable(
+            'time', netcdf_float, ('number_of_timesteps',))
+        time_var.set_collective(True)
+
+        fid.close()
+
+    # ------------------------------------------------------------------
+    # Public interface (mirrors SWW_file)
+    # ------------------------------------------------------------------
+
+    def store_connectivity(self):
+        """Write mesh geometry and static quantities in parallel.
+
+        All ranks participate collectively.  Each rank writes its own
+        local nodes/triangles to the correct global positions.  Ghost
+        triangles are excluded; ghost nodes are written by their owning rank.
+        """
+        domain = self.domain
+        node_l2g = self._node_l2g
+        tri_l2g = self._tri_l2g
+        full_mask = self._tri_full_flag > 0
+
+        # Vertex coordinates and connectivity
+        Q_ref = list(domain.quantities.values())[0]
+        X, Y, _, V = Q_ref.get_vertex_values(xy=True, precision=self.precision)
+        # X, Y: shape (n_local_nodes,)
+        # V:    shape (n_local_tris, 3) — local node indices
+
+        fl_nodes, g_full_nodes = self._full_nodes_of_rank(V)
+
+        fid = self._open('r+')
+
+        # Enable collective I/O on static geometry (helps HDF5 performance)
+        fid.variables['x'].set_collective(True)
+        fid.variables['y'].set_collective(True)
+        fid.variables['volumes'].set_collective(True)
+
+        # x, y: write all local nodes to their global positions.
+        # Nodes on partition boundaries are shared between ranks and will be
+        # written by each rank that owns them.  Since coordinates are
+        # identical across ranks for shared nodes, concurrent writes are
+        # safe.  A future optimisation could assign exclusive ownership
+        # (e.g. each node written only by the lowest-rank owner) to
+        # reduce write contention on large parallel filesystems.
+        fid.variables['x'][node_l2g] = X
+        fid.variables['y'][node_l2g] = Y
+
+        # volumes: full triangles only, translating to global node indices
+        V_full = V[full_mask].astype(int)
+        tri_l2g_full = tri_l2g[full_mask]
+        if V_full.size > 0:
+            g_volumes = node_l2g[V_full]   # (n_full_tris, 3) global indices
+            fid.variables['volumes'][tri_l2g_full] = g_volumes
+
+        # Static vertex quantities (full nodes only)
+        for name in self.static_quantities:
+            Q = domain.quantities[name]
+            A, _ = Q.get_vertex_values(xy=False, precision=self.precision)
+            fid.variables[name].set_collective(True)
+            if g_full_nodes.size > 0:
+                fid.variables[name][g_full_nodes] = A[fl_nodes]
+                local_min = float(num.min(A[fl_nodes]))
+                local_max = float(num.max(A[fl_nodes]))
+            else:
+                local_min = max_float
+                local_max = -max_float
+            # All ranks participate in Allreduce (required for MPI correctness)
+            g_min = self._comm.allreduce(local_min, op=self._MPI.MIN)
+            g_max = self._comm.allreduce(local_max, op=self._MPI.MAX)
+            if self._rank == 0:
+                fid.variables[name + '_range'][0] = g_min
+                fid.variables[name + '_range'][1] = g_max
+
+        # Static centroid quantities (full triangles only)
+        for name in self.static_c_quantities:
+            q_name = name[:-2]
+            Q = domain.quantities[q_name]
+            fid.variables[name].set_collective(True)
+            if full_mask.any():
+                fid.variables[name][tri_l2g[full_mask]] = \
+                    Q.centroid_values[full_mask].astype(self.precision)
+
+        fid.close()
+
+    def store_timestep(self):
+        """Write dynamic quantities for the current timestep in parallel.
+
+        All ranks participate collectively.  Each rank writes to the global
+        node/triangle indices corresponding to its full (non-ghost) cells.
+        """
+        domain = self.domain
+        node_l2g = self._node_l2g
+        tri_l2g = self._tri_l2g
+        full_mask = self._tri_full_flag > 0
+        t_idx = self._timestep_count
+
+        Q_ref = list(domain.quantities.values())[0]
+        _, _, _, V = Q_ref.get_vertex_values(xy=True, precision=self.precision)
+        fl_nodes, g_full_nodes = self._full_nodes_of_rank(V)
+
+        fid = self._open('r+')
+
+        # Time variable (collective — extends unlimited dimension)
+        fid.variables['time'].set_collective(True)
+        fid.variables['time'][t_idx] = domain.relative_time
+
+        # Storable-height mask (wet/dry)
+        z = None
+        storable_indices = None
+        if 'stage' in self.dynamic_quantities:
+            w, _ = domain.quantities['stage'].get_vertex_values(xy=False)
+            z, _ = domain.quantities['elevation'].get_vertex_values(xy=False)
+            storable_indices = num.array(
+                w - z >= self.minimum_storable_height)
+
+        # Dynamic vertex quantities
+        for name in self.dynamic_quantities:
+            Q = domain.quantities[name]
+            A, _ = Q.get_vertex_values(xy=False, precision=self.precision)
+            if storable_indices is not None:
+                if name == 'stage':
+                    A = num.choose(storable_indices, (z, A))
+                elif name in ['xmomentum', 'ymomentum']:
+                    zero_momentum = num.zeros(num.size(A), A.dtype.char)
+                    A = num.choose(storable_indices, (zero_momentum, A))
+
+            fid.variables[name].set_collective(True)
+            if g_full_nodes.size > 0:
+                fid.variables[name][t_idx, g_full_nodes] = A[fl_nodes]
+                local_min = float(num.min(A[fl_nodes]))
+                local_max = float(num.max(A[fl_nodes]))
+            else:
+                local_min = max_float
+                local_max = -max_float
+            # All ranks participate in Allreduce (required for MPI correctness)
+            g_min = self._comm.allreduce(local_min, op=self._MPI.MIN)
+            g_max = self._comm.allreduce(local_max, op=self._MPI.MAX)
+            if self._rank == 0:
+                q_range = fid.variables[name + '_range'][:]
+                if g_min < q_range[0]:
+                    fid.variables[name + '_range'][0] = g_min
+                if g_max > q_range[1]:
+                    fid.variables[name + '_range'][1] = g_max
+
+        # Dynamic centroid quantities
+        for name in self.dynamic_c_quantities:
+            q_name = name[:-2]
+            Q = domain.quantities[q_name]
+            fid.variables[name].set_collective(True)
+            if full_mask.any():
+                fid.variables[name][t_idx, tri_l2g[full_mask]] = \
+                    Q.centroid_values[full_mask].astype(self.precision)
+
+        fid.close()
+        self._timestep_count += 1
+
+    def wait_for_pending_write(self):
+        """No async writes in parallel mode — always synchronous."""
+        pass
+
+    def close(self):
+        """No background executor to shut down in parallel mode."""
+        pass
+
+    def __del__(self):
+        pass
 
 
 class Read_sww:
@@ -571,7 +1080,9 @@ class Write_sww(Write_sts):
                      order=1,
                      sww_precision=netcdf_float32,
                      timezone='UTC',
-                     verbose=False):
+                     verbose=False,
+                     zlib=False,
+                     complevel=4):
         """Write an SWW file header.
 
         Writes the first section of the .sww file.
@@ -581,6 +1092,8 @@ class Write_sww(Write_sts):
         Note, if a list is given the info will be made relative.
         number_of_volumes - the number of triangles
         number_of_points - the number of vertices in the mesh
+        zlib - if True, enable zlib compression on dynamic variables (requires NETCDF4 format)
+        complevel - zlib compression level 1-9 (default 4)
         """
 
         from anuga import get_revision_number
@@ -687,7 +1200,8 @@ class Write_sww(Write_sts):
             outfile.createVariable(q, sww_precision,
                                    ('number_of_volumes',))
 
-        self.write_dynamic_quantities(outfile, times, precis=sww_precision)
+        self.write_dynamic_quantities(outfile, times, precis=sww_precision,
+                                      zlib=zlib, complevel=complevel)
 
         outfile.sync()
 
@@ -796,14 +1310,23 @@ class Write_sww(Write_sts):
         outfile.variables['volumes'][:] = volumes
 
     def write_dynamic_quantities(self, outfile,
-                                 times, precis=netcdf_float32, verbose=False):
+                                 times, precis=netcdf_float32, verbose=False,
+                                 zlib=False, complevel=4):
         """
             Write out given quantities to file.
+
+            zlib - if True apply zlib compression (requires NETCDF4 file format)
+            complevel - compression level 1-9 (default 4, moderate compression/speed)
         """
+
+        compress_kwargs = {}
+        if zlib:
+            compress_kwargs = {'zlib': True, 'complevel': complevel}
 
         for q in self.dynamic_quantities:
             outfile.createVariable(q, precis, ('number_of_timesteps',
-                                               'number_of_points'))
+                                               'number_of_points'),
+                                   **compress_kwargs)
             outfile.createVariable(q + Write_sts.RANGE, precis,
                                    ('numbers_in_range',))
 
@@ -814,7 +1337,8 @@ class Write_sww(Write_sts):
 
         for q in self.dynamic_c_quantities:
             outfile.createVariable(q, precis, ('number_of_timesteps',
-                                               'number_of_volumes'))
+                                               'number_of_volumes'),
+                                   **compress_kwargs)
 
         # Doing sts_precision instead of Float gives cast errors.
         outfile.createVariable('time', netcdf_float, ('number_of_timesteps',))

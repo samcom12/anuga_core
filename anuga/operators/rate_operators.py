@@ -175,13 +175,11 @@ Parameters involving communication
         if not hasattr(gpu_interface, 'gpu_dom') or gpu_interface.gpu_dom is None:
             return
 
-        # Only support non-spatial, non-xarray rates for GPU
-        # Spatial rates (x,y or x,y,t functions) and xarray rates need more complex handling
-        if self.rate_spatial or self.rate_xarray:
-            return
-
-        # Supported rate types: scalar, t, quantity, centroid_array
-        if self.rate_type not in ('scalar', 't', 'quantity', 'centroid_array'):
+        # For spatial/xarray rates the array is computed on CPU each call then
+        # pushed to GPU via apply_rate_operator_array_gpu — all types supported.
+        # Only bail out on truly unknown callable types that can't be handled.
+        if (not self.rate_spatial and not self.rate_xarray and
+                self.rate_type not in ('scalar', 't', 'quantity', 'centroid_array')):
             return
 
         # Get indices - if None, apply to all elements
@@ -242,11 +240,9 @@ Parameters involving communication
         if self.indices is not None and len(self.indices) == 0:
             return
 
-        # Check for GPU execution path
+        # Check for GPU execution path — all rate types handled on GPU
         if (hasattr(self.domain, 'multiprocessor_mode') and
-            self.domain.multiprocessor_mode == MULTIPROCESSOR_GPU and
-            not self.rate_spatial and
-            not self.rate_xarray):
+                self.domain.multiprocessor_mode == MULTIPROCESSOR_GPU):
 
             # Lazy initialization of GPU operator
             if not self._gpu_initialized:
@@ -257,13 +253,91 @@ Parameters involving communication
                 timestep = self.domain.get_timestep()
                 factor = self.get_factor(t)
 
-                # DEBUG: Confirm GPU path taken
-                #print(f"DEBUG Rate_operator: GPU path, op_id={self._gpu_op_id}, rate_type={self.rate_type}, t={t}, timestep={timestep}, factor={factor}")
-                # DEBUG: Check rate quantity info
-                #if self.rate_type == 'quantity':
-                #    print(f"DEBUG Rate_operator: rate quantity name={self.rate.name}, rate object id={id(self.rate)}")
+                if self.rate_xarray:
+                    # xarray rate: update rate array from xarray on CPU, then push to GPU.
+                    # _update_Q_xarray returns True when the xarray timestep changed so we
+                    # know whether a new H2D transfer is needed.
+                    xarray_changed = self._update_Q_xarray()
+                    if isinstance(self.rate, num.ndarray):
+                        # Normal path: rate is a numpy centroid array
+                        from anuga.shallow_water.sw_domain_gpu_ext import apply_rate_operator_array_gpu
+                        if self._gpu_rate_array_cache is None or xarray_changed:
+                            self._gpu_rate_array_cache = num.ascontiguousarray(self.rate, dtype=num.float64)
+                            if self.indices is None:
+                                self._gpu_rate_min_cache = self._gpu_rate_array_cache.min()
+                                self._gpu_rate_max_cache = self._gpu_rate_array_cache.max()
+                            else:
+                                self._gpu_rate_min_cache = self._gpu_rate_array_cache[self.indices].min()
+                                self._gpu_rate_max_cache = self._gpu_rate_array_cache[self.indices].max()
+                            rate_changed = 1
+                        else:
+                            rate_changed = 0  # Same xarray timestep, skip H2D transfer
+                        self.local_influx = apply_rate_operator_array_gpu(
+                            self.domain.gpu_interface.gpu_dom,
+                            self._gpu_op_id,
+                            self._gpu_rate_array_cache,
+                            1,  # use_indices_into_rate (full-domain array indexed by cell id)
+                            rate_changed,
+                            float(factor),
+                            float(timestep)
+                        )
+                        self.local_max = self._gpu_rate_max_cache * factor
+                        self.local_min = self._gpu_rate_min_cache * factor
+                    else:
+                        # default_rate fallback: rate is a callable — use scalar GPU kernel
+                        from anuga.shallow_water.sw_domain_gpu_ext import apply_rate_operator_gpu
+                        rate_val = self.get_non_spatial_rate(t)
+                        try:
+                            rate_scalar = float(rate_val)
+                        except (TypeError, ValueError):
+                            rate_scalar = float(rate_val[0])
+                        self.local_influx = apply_rate_operator_gpu(
+                            self.domain.gpu_interface.gpu_dom,
+                            self._gpu_op_id,
+                            rate_scalar,
+                            float(factor),
+                            float(timestep)
+                        )
+                        self.local_max = rate_scalar * factor if rate_scalar >= 0 else 0.0
+                        self.local_min = rate_scalar * factor if rate_scalar < 0 else 0.0
 
-                if self.rate_type == 'quantity':
+                elif self.rate_spatial:
+                    # Spatial rate: evaluate f(x,y,t) on CPU to get a per-cell array, push to GPU.
+                    from anuga.shallow_water.sw_domain_gpu_ext import apply_rate_operator_array_gpu
+                    if self.indices is None:
+                        x = self.coord_c[:, 0]
+                        y = self.coord_c[:, 1]
+                    else:
+                        x = self.coord_c[self.indices, 0]
+                        y = self.coord_c[self.indices, 1]
+                    rate_arr = num.ascontiguousarray(
+                        self.get_spatial_rate(x, y, t), dtype=num.float64)
+                    # For pure x,y functions (no time dependence) the rate array is
+                    # constant — cache it and skip re-transfer on subsequent calls.
+                    if self.rate_type == 'x,y' and self._gpu_rate_array_cache is not None:
+                        rate_changed = 0
+                    else:
+                        self._gpu_rate_array_cache = rate_arr
+                        if len(rate_arr) > 0:
+                            self._gpu_rate_min_cache = rate_arr.min()
+                            self._gpu_rate_max_cache = rate_arr.max()
+                        else:
+                            self._gpu_rate_min_cache = 0.0
+                            self._gpu_rate_max_cache = 0.0
+                        rate_changed = 1
+                    self.local_influx = apply_rate_operator_array_gpu(
+                        self.domain.gpu_interface.gpu_dom,
+                        self._gpu_op_id,
+                        self._gpu_rate_array_cache,
+                        0,  # NOT use_indices_into_rate (array already indexed to op order)
+                        rate_changed,
+                        float(factor),
+                        float(timestep)
+                    )
+                    self.local_max = self._gpu_rate_max_cache * factor
+                    self.local_min = self._gpu_rate_min_cache * factor
+
+                elif self.rate_type == 'quantity':
                     # Quantity type - use array-based GPU kernel
                     from anuga.shallow_water.sw_domain_gpu_ext import apply_rate_operator_array_gpu
                     # Use cached rate array if available (avoids expensive array copy every RK2 step)
@@ -754,6 +828,16 @@ Parameters involving communication
 
 
     def _update_Q_xarray(self):
+        """Update rate from xarray DataArray at the current simulation time.
+
+        Returns
+        -------
+        bool
+            True if the rate data actually changed (new xarray timestep was
+            selected), False if the same timestep is still active.  Callers
+            that manage a GPU cache can use this flag to skip unnecessary H2D
+            transfers.
+        """
 
         import pandas
         current_utc_datetime64 = pandas.to_datetime(self.domain.get_datetime()).tz_convert('UTC')#.replace(tzinfo=None)
@@ -763,6 +847,7 @@ Parameters involving communication
             print(f"UTC time {current_utc_datetime64} type {type(current_utc_datetime64)} ")
             print(self.xa.sel(time=current_utc_datetime64, method='nearest'))
 
+        rate_changed = True
         try:
             Q_ref = self.xa.sel(time=current_utc_datetime64, method="ffill", tolerance='5m')
 
@@ -773,21 +858,26 @@ Parameters involving communication
 
             optimize = True
             if optimize:
-                if Q_ref_time == self.previous_Q_ref_time :
+                if Q_ref_time == self.previous_Q_ref_time and self.previous_Q_numpy is not None:
+                    # Same xarray timestep: reuse cached numpy array, no need to call set_rate
                     Q_numpy = self.previous_Q_numpy
+                    rate_changed = False
                 else:
                     Q_numpy = Q_ref[self.ii].to_numpy()
                     self.previous_Q_numpy = Q_numpy
                     self.previous_Q_ref_time = Q_ref_time
+                    self.set_rate(rate=Q_numpy)
             else:
                 Q_numpy = Q_ref[self.ii].to_numpy()
+                self.set_rate(rate=Q_numpy)
 
         except Exception:
             Q_numpy = self.default_rate
             if self.verbose:
                 print(f"UTC time {current_utc_datetime64} Using default rate Q = {Q_numpy(self.get_time())}")
+            self.set_rate(rate=Q_numpy)
 
-        self.set_rate(rate=Q_numpy)
+        return rate_changed
 
     def parallel_safe(self):
         """Operator is applied independently on each cell and
