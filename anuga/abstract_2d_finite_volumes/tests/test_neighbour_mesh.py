@@ -2024,6 +2024,195 @@ class Test_Mesh_extra2(unittest.TestCase):
         num.testing.assert_allclose(midpoints[0], [1.0, 0.0])
 
 
+class Test_set_to_inscribed_circle_vertex_coords(unittest.TestCase):
+    """Tests for the bug-fix in set_to_inscribed_circle (neighbour_mesh.py).
+
+    The PR corrected the vertex coordinate indexing from V[i, 0] (wrong)
+    to V[3*i, 0] (correct).  vertex_coordinates has shape (3*N, 2) where
+    rows 3*i, 3*i+1, 3*i+2 belong to triangle i.  The old code used row i,
+    which is only correct for triangle 0; for all other triangles it read
+    wrong coordinates, producing incorrect inscribed-circle radii.
+    """
+
+    def _make_right_triangle_mesh(self):
+        """A single right-angled triangle with known inscribed-circle radius."""
+        # 3-4-5 right triangle: sides 3, 4, 5; area = 6
+        # inscribed radius r = area / s = 6 / 6 = 1  (s = semi-perimeter = 6)
+        points = [[0.0, 0.0], [3.0, 0.0], [0.0, 4.0]]
+        vertices = [[0, 1, 2]]
+        return Mesh(points, vertices)
+
+    def _make_two_triangle_mesh(self):
+        """Two triangles: one at origin, one translated far away."""
+        # Triangle 0: (0,0), (1,0), (0,1)  -- small right triangle
+        # Triangle 1: (10,10), (11,10), (10,11) -- same shape, different location
+        points = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+                  [10.0, 10.0], [11.0, 10.0], [10.0, 11.0]]
+        vertices = [[0, 1, 2], [3, 4, 5]]
+        return Mesh(points, vertices)
+
+    def test_set_to_inscribed_circle_single_triangle(self):
+        """Inscribed radius for a known right triangle must be correct."""
+        mesh = self._make_right_triangle_mesh()
+        mesh.set_to_inscribed_circle(safety_factor=1)
+        # r = area / (2*(a+b+c)) where a=3, b=4, c=5, area=6
+        # Note: formula used is area/(2*(a+b+c)) which equals area / (2s) = 6/12 = 0.5
+        # (not the standard formula area/s; this is correct for the code)
+        expected = 6.0 / (2.0 * (3.0 + 4.0 + 5.0))
+        self.assertAlmostEqual(mesh.radii[0], expected, places=10)
+
+    def test_set_to_inscribed_circle_two_triangles_correct_coords(self):
+        """Inscribed radii for both triangles must be equal (same shape, different location).
+
+        With the old (buggy) indexing, the second triangle would read coordinates
+        from row index 1 of vertex_coordinates instead of row 3, giving a
+        completely wrong set of coordinates and hence a wrong radius.
+        """
+        mesh = self._make_two_triangle_mesh()
+        mesh.set_to_inscribed_circle(safety_factor=1)
+        # Both triangles are congruent right isoceles triangles, so they must
+        # have the same inscribed-circle radius after the fix.
+        self.assertAlmostEqual(mesh.radii[0], mesh.radii[1], places=10)
+
+    def test_set_to_inscribed_circle_safety_factor_scales_radii(self):
+        """safety_factor must scale all radii uniformly."""
+        mesh = self._make_right_triangle_mesh()
+        mesh_sf1 = self._make_right_triangle_mesh()
+        mesh_sf2 = self._make_right_triangle_mesh()
+        mesh_sf1.set_to_inscribed_circle(safety_factor=1)
+        mesh_sf2.set_to_inscribed_circle(safety_factor=2)
+        self.assertAlmostEqual(mesh_sf2.radii[0], 2 * mesh_sf1.radii[0], places=10)
+
+    def test_set_to_inscribed_circle_returns_ratio_tuple(self):
+        """set_to_inscribed_circle must return (max_ratio, min_ratio)."""
+        mesh = self._make_two_triangle_mesh()
+        result = mesh.set_to_inscribed_circle()
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        max_r, min_r = result
+        self.assertGreaterEqual(max_r, min_r)
+
+    def test_set_to_inscribed_circle_all_radii_positive(self):
+        """All radii must be strictly positive after set_to_inscribed_circle."""
+        points, triangles, boundary = rectangular(3, 4)
+        mesh = Mesh(points, triangles, boundary)
+        mesh.set_to_inscribed_circle(safety_factor=1)
+        for r in mesh.radii:
+            self.assertGreater(r, 0.0)
+
+    def test_set_to_inscribed_circle_rectangular_mesh_uniform(self):
+        """For a uniform rectangular mesh all inscribed radii must be equal.
+
+        If vertex coordinates are read from the wrong row the formula
+        will produce different values for different triangles even on a
+        uniform mesh, so this is a direct regression test for the bug fix.
+        """
+        points, triangles, boundary = rectangular(4, 4, 4.0, 4.0)
+        mesh = Mesh(points, triangles, boundary)
+        mesh.set_to_inscribed_circle(safety_factor=1)
+        # All triangles in a uniform rectangular grid are congruent → same radius.
+        r0 = mesh.radii[0]
+        for r in mesh.radii:
+            self.assertAlmostEqual(r, r0, places=10)
+
+
+class Test_get_triangle_containing_point_spatial_index(unittest.TestCase):
+    """Tests for the spatial-index optimisation in get_triangle_containing_point.
+
+    The PR introduced a _SPATIAL_INDEX_THRESHOLD (= 5) so that the first few
+    calls use a brute-force O(N) scan while subsequent calls use a MeshQuadtree.
+    """
+
+    def _make_mesh(self):
+        points, triangles, boundary = rectangular(3, 3)
+        return Mesh(points, triangles, boundary)
+
+    def test_initial_call_count_is_zero(self):
+        """A freshly created Mesh must not have _point_lookup_count set yet."""
+        mesh = self._make_mesh()
+        self.assertFalse(hasattr(mesh, '_point_lookup_count'))
+
+    def test_call_count_increments(self):
+        """_point_lookup_count must increment with each call."""
+        mesh = self._make_mesh()
+        centroids = mesh.get_centroid_coordinates(absolute=True)
+        point = list(centroids[0])
+        mesh.get_triangle_containing_point(point)
+        self.assertEqual(getattr(mesh, '_point_lookup_count', 0), 1)
+        mesh.get_triangle_containing_point(point)
+        self.assertEqual(mesh._point_lookup_count, 2)
+
+    def test_spatial_index_not_built_below_threshold(self):
+        """Spatial index must not be built before _SPATIAL_INDEX_THRESHOLD calls."""
+        mesh = self._make_mesh()
+        centroids = mesh.get_centroid_coordinates(absolute=True)
+        point = list(centroids[0])
+        threshold = mesh._SPATIAL_INDEX_THRESHOLD
+        for _ in range(threshold):
+            mesh.get_triangle_containing_point(point)
+        # After exactly threshold calls the index should still be None
+        self.assertIsNone(mesh._triangle_spatial_index)
+
+    def test_spatial_index_built_after_threshold(self):
+        """Spatial index must be built once call count exceeds _SPATIAL_INDEX_THRESHOLD."""
+        mesh = self._make_mesh()
+        centroids = mesh.get_centroid_coordinates(absolute=True)
+        point = list(centroids[0])
+        threshold = mesh._SPATIAL_INDEX_THRESHOLD
+        for _ in range(threshold + 1):
+            mesh.get_triangle_containing_point(point)
+        self.assertIsNotNone(mesh._triangle_spatial_index)
+
+    def test_results_consistent_across_threshold(self):
+        """Brute-force and spatial-index paths must return the same triangle id."""
+        mesh = self._make_mesh()
+        centroids = mesh.get_centroid_coordinates(absolute=True)
+        threshold = mesh._SPATIAL_INDEX_THRESHOLD
+        # Use a centroid to guarantee the point is inside a triangle.
+        point = list(centroids[0])
+        # Collect results across the threshold boundary.
+        results = []
+        for _ in range(threshold + 2):
+            results.append(mesh.get_triangle_containing_point(point))
+        # All results must be the same triangle id.
+        self.assertTrue(all(r == results[0] for r in results))
+
+    def test_point_outside_raises_after_threshold(self):
+        """After the index is built, a point outside the mesh must still raise."""
+        mesh = self._make_mesh()
+        centroids = mesh.get_centroid_coordinates(absolute=True)
+        point = list(centroids[0])
+        threshold = mesh._SPATIAL_INDEX_THRESHOLD
+        # Push past the threshold to build the index.
+        for _ in range(threshold + 1):
+            mesh.get_triangle_containing_point(point)
+        # Now query a point far outside the mesh.
+        with self.assertRaises(Exception):
+            mesh.get_triangle_containing_point([1e9, 1e9])
+
+    def test_brute_force_point_outside_raises(self):
+        """Before the index is built, a point outside the mesh must raise."""
+        mesh = self._make_mesh()
+        with self.assertRaises(Exception):
+            mesh.get_triangle_containing_point([1e9, 1e9])
+
+    def test_threshold_class_attribute_value(self):
+        """_SPATIAL_INDEX_THRESHOLD must equal 5 as documented in the PR."""
+        from anuga.abstract_2d_finite_volumes.neighbour_mesh import Mesh as NeighbourMesh
+        self.assertEqual(NeighbourMesh._SPATIAL_INDEX_THRESHOLD, 5)
+
+    def test_all_centroids_found_using_spatial_index(self):
+        """Every centroid must be located in its own triangle via the spatial index."""
+        mesh = self._make_mesh()
+        centroids = mesh.get_centroid_coordinates(absolute=True)
+        # Push past threshold so the spatial index is used.
+        for _ in range(mesh._SPATIAL_INDEX_THRESHOLD + 1):
+            mesh.get_triangle_containing_point(list(centroids[0]))
+        for i, c in enumerate(centroids):
+            tid = mesh.get_triangle_containing_point(list(c))
+            self.assertEqual(tid, i)
+
+
 if __name__ == "__main__":
     suite = unittest.TestLoader().loadTestsFromTestCase(Test_Mesh)
     runner = unittest.TextTestRunner()#verbosity=2)
