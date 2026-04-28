@@ -874,7 +874,7 @@ Parameters involving communication
         except Exception:
             Q_numpy = self.default_rate
             if self.verbose:
-                print(f"UTC time {current_utc_datetime64} Using default rate Q = {Q_numpy(self.get_time())}")
+                print(f"UTC time {current_utc_datetime64} Using default rate Q = {Q_numpy(self.domain.get_time())}")
             self.set_rate(rate=Q_numpy)
 
         return rate_changed

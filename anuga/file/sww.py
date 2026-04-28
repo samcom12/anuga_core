@@ -479,11 +479,11 @@ class SWW_file(Data_format):
 
         if snapshot['extrema_snapshot'] is not None:
             for q, info in snapshot['extrema_snapshot'].items():
-                if info['min'] is not None:
+                if info['min'] is not None and info['min_location'] is not None:
                     fid.variables[q + '.extrema'][0] = info['min']
                     fid.variables[q + '.min_location'][:] = info['min_location']
                     fid.variables[q + '.min_time'][0] = info['min_time']
-                if info['max'] is not None:
+                if info['max'] is not None and info['max_location'] is not None:
                     fid.variables[q + '.extrema'][1] = info['max']
                     fid.variables[q + '.max_location'][:] = info['max_location']
                     fid.variables[q + '.max_time'][0] = info['max_time']
