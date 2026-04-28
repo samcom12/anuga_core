@@ -187,15 +187,22 @@ void gpu_halo_finalize(struct gpu_domain *GD) {
     if (H->recv_buffer) free(H->recv_buffer);
 #endif
     if (H->requests) {
-        // Free persistent MPI requests before releasing the array
+        // Free persistent MPI requests before releasing the array.
+        // Guard with MPI_Finalized() because gpu_domain_finalize may be called
+        // after MPI_Finalize in some shutdown orderings, and calling
+        // MPI_Request_free after finalization is undefined behaviour.
         if (H->use_persistent) {
-            for (int i = 0; i < 2 * H->num_neighbors; i++) {
-                if (H->requests[i] != MPI_REQUEST_NULL)
-                    MPI_Request_free(&H->requests[i]);
+            int mpi_finalized = 0;
+            MPI_Finalized(&mpi_finalized);
+            if (!mpi_finalized) {
+                for (int i = 0; i < 2 * H->num_neighbors; i++) {
+                    if (H->requests[i] != MPI_REQUEST_NULL)
+                        MPI_Request_free(&H->requests[i]);
+                }
             }
         }
         free(H->requests);
-    }
+
 
     H->num_neighbors = 0;
     H->neighbor_ranks = NULL;
