@@ -515,14 +515,17 @@ Creating domain from scratch.
         tol2 = tol * tol
         n_tagged = 0
 
+        # Hoist geo_reference outside the per-wall loop
+        xoff = domain.geo_reference.get_xllcorner()
+        yoff = domain.geo_reference.get_yllcorner()
+
         for wall_name, wall_coords in riverWalls.items():
-            pts = _np.asarray(wall_coords, dtype=float)   # shape (M, 2)
+            pts = _np.asarray(wall_coords, dtype=float)
             if len(pts) < 2:
                 continue
-            # riverWalls coords are in absolute UTM; convert to domain-relative
-            xoff = domain.geo_reference.get_xllcorner()
-            yoff = domain.geo_reference.get_yllcorner()
-            pts_rel = pts - _np.array([[xoff, yoff]])
+            # CSV files carry (x, y, elevation) — keep only x, y columns.
+            # Subtract domain geo_reference offset to get domain-relative coords.
+            pts_rel = pts[:, :2] - _np.array([[xoff, yoff]])
 
             mask = _np.zeros(n_tri, dtype=bool)
             for i in range(len(pts_rel) - 1):
