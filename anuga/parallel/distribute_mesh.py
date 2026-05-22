@@ -195,6 +195,11 @@ def partition_mesh(domain, n_procs,
     if 'verbose' in parameters:
         verbose = bool(parameters['verbose'])
 
+    # Per-triangle computational weights for load-balanced METIS partitioning.
+    # Triangles adjacent to expensive features (e.g. riverwalls) should carry
+    # higher weights so METIS distributes total work, not just cell count.
+    vertex_weights = parameters.get('vertex_weights', None)
+
     # Output partitioning parameters if verbose
     if verbose:
         print("partition_mesh: Number of processors: {}".format(n_procs))
@@ -223,7 +228,8 @@ def partition_mesh(domain, n_procs,
     elif partition_scheme == 'hilbert':
         epart_order, triangles_per_proc = hilbert_partition(domain, n_procs)
     else:
-        epart_order, triangles_per_proc = metis_partition(domain, n_procs)
+        epart_order, triangles_per_proc = metis_partition(domain, n_procs,
+                                                          vertex_weights=vertex_weights)
 
     # Build processor IDs and local indices in a fully vectorized way
     proc_ids = num.repeat(num.arange(n_procs, dtype=int), triangles_per_proc)

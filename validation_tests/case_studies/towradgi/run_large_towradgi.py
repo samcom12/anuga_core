@@ -468,9 +468,81 @@ Creating domain from scratch.
     
     if myid == 0 and verbose:
         print('DISTRIBUTING DOMAIN')
-    
-    domain = distribute(domain, verbose=verbose)
-    
+
+    # -------------------------------------------------------------------------
+    # Riverwall-aware METIS partitioning
+    # -------------------------------------------------------------------------
+    # Without weights, METIS partitions by triangle count alone.  All riverwall
+    # edges happen to fall in one spatial region and land entirely on rank 0,
+    # leaving rank 1 idle for 93% of the run (observed: MPI_Barrier 11.77 s).
+    #
+    # Fix: assign higher vertex (triangle) weights to cells adjacent to riverwall
+    # polylines so METIS balances *computational load*, not just cell count.
+    # Riverwall Riemann solver costs ~8x more than a plain interior edge.
+    #
+    # Weight scheme:
+    #   base_weight      = 1   (all triangles)
+    #   riverwall_weight = 8   (triangles whose centroid is within tol of any
+    #                           riverwall polyline segment)
+    # -------------------------------------------------------------------------
+    distribute_parameters = {}
+    if myid == 0 and numprocs > 1:
+        import numpy as _np
+
+        RIVERWALL_WEIGHT = 8   # Riemann solver multiplier — tune if needed
+        BASE_WEIGHT      = 1
+
+        # Search radius: sqrt of median triangle area * 0.75 ~ half an edge length
+        areas     = domain.get_areas()
+        tol       = float(_np.sqrt(_np.median(areas))) * 0.75
+        n_tri     = domain.number_of_triangles
+        weights   = _np.full(n_tri, BASE_WEIGHT, dtype=_np.int32)
+
+        # Centroids of all triangles in domain-relative coordinates
+        centroids = domain.get_centroid_coordinates(absolute=False)
+        cx = centroids[:, 0]
+        cy = centroids[:, 1]
+
+        def _dist2_to_segment(px, py, ax, ay, bx, by):
+            """Vectorised squared distance from N points to one line segment."""
+            dx, dy   = bx - ax, by - ay
+            seg_len2 = dx*dx + dy*dy
+            if seg_len2 == 0.0:
+                return (px - ax)**2 + (py - ay)**2
+            t = _np.clip(((px - ax)*dx + (py - ay)*dy) / seg_len2, 0.0, 1.0)
+            return (px - ax - t*dx)**2 + (py - ay - t*dy)**2
+
+        tol2 = tol * tol
+        n_tagged = 0
+
+        for wall_name, wall_coords in riverWalls.items():
+            pts = _np.asarray(wall_coords, dtype=float)   # shape (M, 2)
+            if len(pts) < 2:
+                continue
+            # riverWalls coords are in absolute UTM; convert to domain-relative
+            xoff = domain.geo_reference.get_xllcorner()
+            yoff = domain.geo_reference.get_yllcorner()
+            pts_rel = pts - _np.array([[xoff, yoff]])
+
+            mask = _np.zeros(n_tri, dtype=bool)
+            for i in range(len(pts_rel) - 1):
+                ax, ay = pts_rel[i]
+                bx, by = pts_rel[i + 1]
+                d2 = _dist2_to_segment(cx, cy, ax, ay, bx, by)
+                mask |= (d2 <= tol2)
+
+            newly_tagged = int(mask.sum()) - int((weights[mask] > BASE_WEIGHT).sum())
+            n_tagged    += newly_tagged
+            weights[mask] = RIVERWALL_WEIGHT
+
+        print(f'[distribute] Riverwall-aware METIS weights: '
+              f'{n_tagged} cells tagged with weight={RIVERWALL_WEIGHT} '
+              f'(tol={tol:.1f} m, total_weight={int(weights.sum())})')
+
+        distribute_parameters = {'vertex_weights': weights.tolist()}
+
+    domain = distribute(domain, verbose=verbose, parameters=distribute_parameters)
+
     barrier()
 
     # -----------------------------------------------------------------------------
