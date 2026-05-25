@@ -470,79 +470,86 @@ Creating domain from scratch.
         print('DISTRIBUTING DOMAIN')
 
     # -------------------------------------------------------------------------
-    # Riverwall-aware METIS partitioning
+    # Riverwall-aware forced partition
     # -------------------------------------------------------------------------
-    # Without weights, METIS partitions by triangle count alone.  All riverwall
-    # edges happen to fall in one spatial region and land entirely on rank 0,
-    # leaving rank 1 idle for 93% of the run (observed: MPI_Barrier 11.77 s).
+    # Problem: METIS minimises edge cuts as its primary objective.  All 8
+    # riverwall polylines are spatially clustered, so METIS puts them all on
+    # rank 0 regardless of vertex weights — splitting them increases cut edges.
+    # Result: rank 0 owns all 108 riverwall edges; rank 1 idles in MPI_Barrier
+    # for 11-13 s (93% of the run).
     #
-    # Fix: assign higher vertex (triangle) weights to cells adjacent to riverwall
-    # polylines so METIS balances *computational load*, not just cell count.
-    # Riverwall Riemann solver costs ~8x more than a plain interior edge.
-    #
-    # Weight scheme:
-    #   base_weight      = 1   (all triangles)
-    #   riverwall_weight = 8   (triangles whose centroid is within tol of any
-    #                           riverwall polyline segment)
+    # Fix: run METIS normally to get a balanced baseline partition, then find
+    # all triangles adjacent to riverwall polylines and forcibly reassign them
+    # alternately to rank 0 and rank 1 (sorted by x-centroid so each rank gets
+    # a contiguous half of each riverwall segment).  Pass the result as
+    # 'forced_partition' to partition_mesh which bypasses METIS for those cells.
     # -------------------------------------------------------------------------
     distribute_parameters = {}
     if myid == 0 and numprocs > 1:
         import numpy as _np
+        from anuga.parallel.partitioning import metis_partition
 
-        RIVERWALL_WEIGHT = 8   # Riemann solver multiplier — tune if needed
-        BASE_WEIGHT      = 1
-
-        # Search radius: sqrt of median triangle area * 0.75 ~ half an edge length
-        areas     = domain.get_areas()
-        tol       = float(_np.sqrt(_np.median(areas))) * 0.75
         n_tri     = domain.number_of_triangles
-        weights   = _np.full(n_tri, BASE_WEIGHT, dtype=_np.int32)
-
-        # Centroids of all triangles in domain-relative coordinates
         centroids = domain.get_centroid_coordinates(absolute=False)
-        cx = centroids[:, 0]
-        cy = centroids[:, 1]
+        cx        = centroids[:, 0]
+        cy        = centroids[:, 1]
+        xoff      = domain.geo_reference.get_xllcorner()
+        yoff      = domain.geo_reference.get_yllcorner()
 
-        def _dist2_to_segment(px, py, ax, ay, bx, by):
-            """Vectorised squared distance from N points to one line segment."""
+        # Step 1 — run standard METIS to get a balanced baseline
+        epart_order, tpp = metis_partition(domain, numprocs)
+        partition = _np.empty(n_tri, dtype=_np.int32)
+        partition[epart_order] = _np.repeat(
+            _np.arange(numprocs, dtype=_np.int32), tpp)
+
+        # Step 2 — find triangles adjacent to any riverwall polyline
+        areas   = domain.get_areas()
+        rw_band = float(_np.sqrt(_np.median(areas))) * 3.0
+
+        def _d2seg(px, py, ax, ay, bx, by):
             dx, dy   = bx - ax, by - ay
-            seg_len2 = dx*dx + dy*dy
-            if seg_len2 == 0.0:
-                return (px - ax)**2 + (py - ay)**2
-            t = _np.clip(((px - ax)*dx + (py - ay)*dy) / seg_len2, 0.0, 1.0)
+            s2       = dx*dx + dy*dy
+            if s2 == 0.0:
+                return (px-ax)**2 + (py-ay)**2
+            t = _np.clip(((px-ax)*dx + (py-ay)*dy) / s2, 0.0, 1.0)
             return (px - ax - t*dx)**2 + (py - ay - t*dy)**2
 
-        tol2 = tol * tol
-        n_tagged = 0
-
-        # Hoist geo_reference outside the per-wall loop
-        xoff = domain.geo_reference.get_xllcorner()
-        yoff = domain.geo_reference.get_yllcorner()
-
+        rw_mask = _np.zeros(n_tri, dtype=bool)
         for wall_name, wall_coords in riverWalls.items():
             pts = _np.asarray(wall_coords, dtype=float)
             if len(pts) < 2:
                 continue
-            # CSV files carry (x, y, elevation) — keep only x, y columns.
-            # Subtract domain geo_reference offset to get domain-relative coords.
             pts_rel = pts[:, :2] - _np.array([[xoff, yoff]])
-
-            mask = _np.zeros(n_tri, dtype=bool)
             for i in range(len(pts_rel) - 1):
-                ax, ay = pts_rel[i]
-                bx, by = pts_rel[i + 1]
-                d2 = _dist2_to_segment(cx, cy, ax, ay, bx, by)
-                mask |= (d2 <= tol2)
+                rw_mask |= (_d2seg(cx, cy,
+                                   pts_rel[i,0],   pts_rel[i,1],
+                                   pts_rel[i+1,0], pts_rel[i+1,1])
+                            <= rw_band**2)
 
-            newly_tagged = int(mask.sum()) - int((weights[mask] > BASE_WEIGHT).sum())
-            n_tagged    += newly_tagged
-            weights[mask] = RIVERWALL_WEIGHT
+        # Step 3 — split riverwall cells 50/50 by x-centroid across both ranks
+        rw_idx    = _np.where(rw_mask)[0]
+        rw_sorted = rw_idx[_np.argsort(cx[rw_idx])]
+        half      = len(rw_sorted) // 2
+        partition[rw_sorted[:half]] = 0
+        partition[rw_sorted[half:]] = 1
 
-        print(f'[distribute] Riverwall-aware METIS weights: '
-              f'{n_tagged} cells tagged with weight={RIVERWALL_WEIGHT} '
-              f'(tol={tol:.1f} m, total_weight={int(weights.sum())})')
+        # Rebalance non-riverwall cells so total counts are equal
+        n_target = n_tri // numprocs
+        for r in range(numprocs):
+            non_rw_r = _np.where(~rw_mask & (partition == r))[0]
+            excess   = int((partition == r).sum()) - n_target
+            if excess > 0:
+                other = (r + 1) % numprocs
+                flip  = non_rw_r[:excess]
+                partition[flip] = other
 
-        distribute_parameters = {'vertex_weights': weights.tolist()}
+        for r in range(numprocs):
+            cnt    = int((partition == r).sum())
+            rw_cnt = int((rw_mask & (partition == r)).sum())
+            print('[distribute] Rank {}: {} triangles, {} riverwall-adjacent'
+                  .format(r, cnt, rw_cnt))
+
+        distribute_parameters = {'forced_partition': partition.tolist()}
 
     domain = distribute(domain, verbose=verbose, parameters=distribute_parameters)
 
