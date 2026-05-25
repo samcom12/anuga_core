@@ -468,91 +468,9 @@ Creating domain from scratch.
     
     if myid == 0 and verbose:
         print('DISTRIBUTING DOMAIN')
-
-    # -------------------------------------------------------------------------
-    # Riverwall-aware forced partition
-    # -------------------------------------------------------------------------
-    # Problem: METIS minimises edge cuts as its primary objective.  All 8
-    # riverwall polylines are spatially clustered, so METIS puts them all on
-    # rank 0 regardless of vertex weights — splitting them increases cut edges.
-    # Result: rank 0 owns all 108 riverwall edges; rank 1 idles in MPI_Barrier
-    # for 11-13 s (93% of the run).
-    #
-    # Fix: run METIS normally to get a balanced baseline partition, then find
-    # all triangles adjacent to riverwall polylines and forcibly reassign them
-    # alternately to rank 0 and rank 1 (sorted by x-centroid so each rank gets
-    # a contiguous half of each riverwall segment).  Pass the result as
-    # 'forced_partition' to partition_mesh which bypasses METIS for those cells.
-    # -------------------------------------------------------------------------
-    distribute_parameters = {}
-    if myid == 0 and numprocs > 1:
-        import numpy as _np
-        from anuga.parallel.partitioning import metis_partition
-
-        n_tri     = domain.number_of_triangles
-        centroids = domain.get_centroid_coordinates(absolute=False)
-        cx        = centroids[:, 0]
-        cy        = centroids[:, 1]
-        xoff      = domain.geo_reference.get_xllcorner()
-        yoff      = domain.geo_reference.get_yllcorner()
-
-        # Step 1 — run standard METIS to get a balanced baseline
-        epart_order, tpp = metis_partition(domain, numprocs)
-        partition = _np.empty(n_tri, dtype=_np.int32)
-        partition[epart_order] = _np.repeat(
-            _np.arange(numprocs, dtype=_np.int32), tpp)
-
-        # Step 2 — find triangles adjacent to any riverwall polyline
-        areas   = domain.get_areas()
-        rw_band = float(_np.sqrt(_np.median(areas))) * 3.0
-
-        def _d2seg(px, py, ax, ay, bx, by):
-            dx, dy   = bx - ax, by - ay
-            s2       = dx*dx + dy*dy
-            if s2 == 0.0:
-                return (px-ax)**2 + (py-ay)**2
-            t = _np.clip(((px-ax)*dx + (py-ay)*dy) / s2, 0.0, 1.0)
-            return (px - ax - t*dx)**2 + (py - ay - t*dy)**2
-
-        rw_mask = _np.zeros(n_tri, dtype=bool)
-        for wall_name, wall_coords in riverWalls.items():
-            pts = _np.asarray(wall_coords, dtype=float)
-            if len(pts) < 2:
-                continue
-            pts_rel = pts[:, :2] - _np.array([[xoff, yoff]])
-            for i in range(len(pts_rel) - 1):
-                rw_mask |= (_d2seg(cx, cy,
-                                   pts_rel[i,0],   pts_rel[i,1],
-                                   pts_rel[i+1,0], pts_rel[i+1,1])
-                            <= rw_band**2)
-
-        # Step 3 — split riverwall cells 50/50 by x-centroid across both ranks
-        rw_idx    = _np.where(rw_mask)[0]
-        rw_sorted = rw_idx[_np.argsort(cx[rw_idx])]
-        half      = len(rw_sorted) // 2
-        partition[rw_sorted[:half]] = 0
-        partition[rw_sorted[half:]] = 1
-
-        # Rebalance non-riverwall cells so total counts are equal
-        n_target = n_tri // numprocs
-        for r in range(numprocs):
-            non_rw_r = _np.where(~rw_mask & (partition == r))[0]
-            excess   = int((partition == r).sum()) - n_target
-            if excess > 0:
-                other = (r + 1) % numprocs
-                flip  = non_rw_r[:excess]
-                partition[flip] = other
-
-        for r in range(numprocs):
-            cnt    = int((partition == r).sum())
-            rw_cnt = int((rw_mask & (partition == r)).sum())
-            print('[distribute] Rank {}: {} triangles, {} riverwall-adjacent'
-                  .format(r, cnt, rw_cnt))
-
-        distribute_parameters = {'forced_partition': partition.tolist()}
-
-    domain = distribute(domain, verbose=verbose, parameters=distribute_parameters)
-
+    
+    domain = distribute(domain, verbose=verbose)
+    
     barrier()
 
     # -----------------------------------------------------------------------------

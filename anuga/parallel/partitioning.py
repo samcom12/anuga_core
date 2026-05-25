@@ -11,7 +11,7 @@ import numpy as np
 # Partitioning using METIS. This minimizes edge cuts and is ideal for parallel computations.
 #==============================================================================================================
 
-def metis_partition(domain, n_procs, vertex_weights=None):
+def metis_partition(domain, n_procs):
     """
     Partition a mesh using METIS partitioning library.
 
@@ -63,11 +63,6 @@ def metis_partition(domain, n_procs, vertex_weights=None):
     except ImportError:
         metis_version = "5_part_graph"
 
-    # part_mesh doesn't expose vweights in current pymetis API —
-    # fall back to part_graph so vertex_weights are honoured.
-    if vertex_weights is not None and metis_version == "5_part_mesh":
-        metis_version = "5_part_graph"
-
     n_tri = domain.number_of_triangles
 
     if n_procs > n_tri:
@@ -101,11 +96,7 @@ def metis_partition(domain, n_procs, vertex_weights=None):
             if neigh[i][0] < 0:
                 del neigh[i][0]
 
-        if vertex_weights is not None:
-            vw = [int(w) for w in vertex_weights]
-            cutcount, partvert = part_graph(n_procs, neigh, vweights=vw)
-        else:
-            cutcount, partvert = part_graph(n_procs, neigh)
+        cutcount, partvert = part_graph(n_procs, neigh)
 
         epart = partvert
 

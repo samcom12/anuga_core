@@ -195,11 +195,6 @@ def partition_mesh(domain, n_procs,
     if 'verbose' in parameters:
         verbose = bool(parameters['verbose'])
 
-    # Per-triangle computational weights for load-balanced METIS partitioning.
-    # Triangles adjacent to expensive features (e.g. riverwalls) should carry
-    # higher weights so METIS distributes total work, not just cell count.
-    vertex_weights = parameters.get('vertex_weights', None)
-
     # Output partitioning parameters if verbose
     if verbose:
         print("partition_mesh: Number of processors: {}".format(n_procs))
@@ -222,33 +217,13 @@ def partition_mesh(domain, n_procs,
 
     from anuga.parallel.partitioning import metis_partition, morton_partition, hilbert_partition
 
-    # Optional fully-manual partition: caller passes 'forced_partition', an
-    # int array of length n_tri where forced_partition[i] is the rank that
-    # triangle i is assigned to.  Useful when METIS spatial clustering prevents
-    # proper load balancing (e.g. all riverwalls ending up on one rank).
-    forced_partition = parameters.get('forced_partition', None)
-
     if verbose: print("partition_mesh: Computing partitioning using {}...".format(partition_scheme))
-
-    if forced_partition is not None:
-        forced_partition = num.asarray(forced_partition, dtype=int)
-        if len(forced_partition) != n_tri:
-            raise ValueError(
-                "forced_partition length {} != n_tri {}".format(
-                    len(forced_partition), n_tri))
-        epart_order = num.argsort(forced_partition, kind='stable')
-        triangles_per_proc = [int((forced_partition == r).sum())
-                              for r in range(n_procs)]
-        if verbose:
-            for r, cnt in enumerate(triangles_per_proc):
-                print("partition_mesh: forced_partition rank {}: {} triangles".format(r, cnt))
-    elif partition_scheme == 'morton':
+    if partition_scheme == 'morton':
         epart_order, triangles_per_proc = morton_partition(domain, n_procs)
     elif partition_scheme == 'hilbert':
         epart_order, triangles_per_proc = hilbert_partition(domain, n_procs)
     else:
-        epart_order, triangles_per_proc = metis_partition(domain, n_procs,
-                                                          vertex_weights=vertex_weights)
+        epart_order, triangles_per_proc = metis_partition(domain, n_procs)
 
     # Build processor IDs and local indices in a fully vectorized way
     proc_ids = num.repeat(num.arange(n_procs, dtype=int), triangles_per_proc)
