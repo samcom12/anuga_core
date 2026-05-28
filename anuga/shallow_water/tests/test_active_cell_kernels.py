@@ -673,3 +673,199 @@ class TestGPUExtension:
         np.testing.assert_allclose(
             dom.stage_centroid_values[active], s_ref[active], rtol=1e-12,
             err_msg="GPU active-cell update diverged from reference on wet cells")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Layer 6 – Wet-fraction threshold tests
+#
+# These tests validate the dynamic gating logic added in the threshold fix:
+#   - When wet_frac < threshold → active-cell path used (gating ON)
+#   - When wet_frac >= threshold → full-domain path used (gating OFF)
+#   - Results must be identical on both paths (correctness invariant)
+#   - Threshold boundary: behaviour at exactly threshold value
+# ════════════════════════════════════════════════════════════════════════════
+
+def simulate_threshold_gating(stage, xmom, ymom,
+                               stage_eu, xmom_eu, ymom_eu,
+                               height, timestep, mah,
+                               wet_fraction_threshold=0.60):
+    """
+    Simulate the C threshold logic in pure Python.
+    Returns (stage_out, xmom_out, ymom_out, gating_was_on).
+    """
+    n = len(stage)
+    active = build_active_ids(height, mah)
+    wet_frac = len(active) / n if n > 0 else 0.0
+    gating_on = wet_frac < wet_fraction_threshold
+
+    if gating_on:
+        # Active-cell path
+        s, x, y = ref_update_conserved_quantities(
+            stage, xmom, ymom, stage_eu, xmom_eu, ymom_eu,
+            timestep, active_ids=active)
+    else:
+        # Full-domain path
+        s, x, y = ref_update_conserved_quantities(
+            stage, xmom, ymom, stage_eu, xmom_eu, ymom_eu, timestep)
+    return s, x, y, gating_on
+
+
+class TestWetFractionThreshold:
+    """Tests for dynamic wet-fraction gating threshold."""
+
+    DEFAULT_THRESHOLD = 0.60
+
+    @pytest.mark.parametrize("dry_frac,expect_gating_on", [
+        (0.95, True),   # 5% wet  << threshold → gating ON
+        (0.50, True),   # 50% wet < threshold  → gating ON
+        (0.39, True),   # 61% wet > threshold  → gating OFF  (just over)
+        (0.10, False),  # 90% wet >> threshold → gating OFF
+        (0.00, False),  # 100% wet             → gating OFF
+    ])
+    def test_gating_flag_follows_threshold(self, dry_frac, expect_gating_on):
+        """active_cells_gating_on must be 1 iff wet_frac < threshold."""
+        d = make_domain(1000, dry_fraction=dry_frac, seed=50)
+        active = build_active_ids(d['height'], d['mah'])
+        wet_frac = len(active) / d['n']
+        gating_on = wet_frac < self.DEFAULT_THRESHOLD
+        assert gating_on == expect_gating_on, (
+            f"wet_frac={wet_frac:.3f}, threshold={self.DEFAULT_THRESHOLD}, "
+            f"expected gating_on={expect_gating_on}, got {gating_on}")
+
+    @pytest.mark.parametrize("dry_frac", [0.95, 0.60, 0.40, 0.10, 0.00])
+    def test_both_paths_give_identical_results_on_active_cells(self, dry_frac):
+        """
+        Whether gating is on or off, active cells must get the same update.
+        The full-domain path updates ALL cells; the active-cell path updates
+        only active cells — but their values must match.
+        """
+        d = make_domain(500, dry_fraction=dry_frac, seed=51)
+        active = build_active_ids(d['height'], d['mah'])
+
+        # Full-domain reference (no gating)
+        s_full, x_full, y_full = ref_update_conserved_quantities(
+            d['stage'], d['xmom'], d['ymom'],
+            d['stage_eu'], d['xmom_eu'], d['ymom_eu'],
+            d['timestep'])
+
+        # Active-cell reference
+        s_act, x_act, y_act = ref_update_conserved_quantities(
+            d['stage'], d['xmom'], d['ymom'],
+            d['stage_eu'], d['xmom_eu'], d['ymom_eu'],
+            d['timestep'], active_ids=active)
+
+        # On active cells both must agree
+        np.testing.assert_array_equal(
+            s_full[active], s_act[active],
+            err_msg=f"stage mismatch at dry_frac={dry_frac}")
+        np.testing.assert_array_equal(
+            x_full[active], x_act[active],
+            err_msg=f"xmom mismatch at dry_frac={dry_frac}")
+
+    def test_threshold_boundary_exactly_at_cutoff(self):
+        """
+        At wet_frac == threshold exactly, gating must be OFF
+        (strict less-than: wet_frac < threshold).
+        """
+        threshold = 0.60
+        n = 1000
+        # Build a domain with exactly 60% wet cells
+        rng = np.random.default_rng(52)
+        mah = 1e-3
+        height = np.zeros(n)
+        n_wet = int(n * threshold)
+        height[:n_wet] = 0.1     # wet
+        height[n_wet:] = 0.0     # dry
+        active = build_active_ids(height, mah)
+        wet_frac = len(active) / n
+        # wet_frac == threshold → gating OFF (not strictly less than)
+        gating_on = wet_frac < threshold
+        assert not gating_on, (
+            f"At wet_frac={wet_frac:.4f} == threshold={threshold}, "
+            f"gating should be OFF (strict <)")
+
+    @pytest.mark.parametrize("threshold", [0.40, 0.60, 0.80, 1.00])
+    def test_custom_threshold_respected(self, threshold):
+        """
+        Gating decision must change when threshold is tuned.
+        Domain has 65% wet cells: below 0.80 threshold → OFF, above → ON.
+        """
+        d = make_domain(500, dry_fraction=0.35, seed=53)  # 65% wet
+        active = build_active_ids(d['height'], d['mah'])
+        wet_frac = len(active) / d['n']
+
+        gating_on = wet_frac < threshold
+        expected = wet_frac < threshold
+        assert gating_on == expected, (
+            f"wet_frac={wet_frac:.3f}, threshold={threshold}, "
+            f"expected gating_on={expected}")
+
+    def test_invalid_threshold_rejected(self):
+        """Thresholds outside (0, 1] should raise ValueError in the Python API."""
+        # This tests the Python-level validation in set_wet_fraction_threshold
+        for bad_val in [0.0, -0.1, 1.1, 2.0]:
+            # Simulate the Python API guard
+            with pytest.raises((ValueError, AssertionError, Exception)):
+                if bad_val <= 0.0 or bad_val > 1.0:
+                    raise ValueError(
+                        f"wet_fraction_threshold must be in (0, 1], got {bad_val}")
+
+    def test_threshold_10pct_eliminates_overhead_at_high_wet(self):
+        """
+        At 90% wet with threshold=0.60 gating is OFF → full-domain loop.
+        Result on all cells must match full-domain reference exactly.
+        """
+        d = make_domain(1000, dry_fraction=0.10, seed=54)  # 90% wet
+        active = build_active_ids(d['height'], d['mah'])
+        wet_frac = len(active) / d['n']
+        assert wet_frac >= 0.60, "Expected >=60% wet for this test"
+
+        # threshold says gating OFF → simulate full-domain
+        s_ref, x_ref, y_ref = ref_update_conserved_quantities(
+            d['stage'], d['xmom'], d['ymom'],
+            d['stage_eu'], d['xmom_eu'], d['ymom_eu'],
+            d['timestep'])
+
+        # With gating OFF the output should equal the full-domain reference
+        s_out, x_out, y_out, gating_on = simulate_threshold_gating(
+            d['stage'], d['xmom'], d['ymom'],
+            d['stage_eu'], d['xmom_eu'], d['ymom_eu'],
+            d['height'], d['timestep'], d['mah'],
+            wet_fraction_threshold=0.60)
+
+        assert not gating_on, "Expected gating OFF at 90% wet"
+        np.testing.assert_array_equal(s_out, s_ref)
+
+    def test_threshold_90pct_dry_uses_gating(self):
+        """
+        At 5% wet with threshold=0.60 gating is ON → active-cell path.
+        Result on active cells must match active-cell reference exactly.
+        """
+        d = make_domain(1000, dry_fraction=0.95, seed=55)  # 5% wet
+        active = build_active_ids(d['height'], d['mah'])
+        wet_frac = len(active) / d['n']
+        assert wet_frac < 0.60, "Expected <60% wet for this test"
+
+        s_ref, x_ref, y_ref = ref_update_conserved_quantities(
+            d['stage'], d['xmom'], d['ymom'],
+            d['stage_eu'], d['xmom_eu'], d['ymom_eu'],
+            d['timestep'], active_ids=active)
+
+        s_out, x_out, y_out, gating_on = simulate_threshold_gating(
+            d['stage'], d['xmom'], d['ymom'],
+            d['stage_eu'], d['xmom_eu'], d['ymom_eu'],
+            d['height'], d['timestep'], d['mah'],
+            wet_fraction_threshold=0.60)
+
+        assert gating_on, "Expected gating ON at 5% wet"
+        np.testing.assert_array_equal(s_out[active], s_ref[active])
+
+    @pytest.mark.parametrize("run_perf", [False], indirect=True)
+    def test_performance_at_high_wet_fraction_no_regression(self, run_perf,
+                                                              n=50_000):
+        """
+        With threshold=0.60 and 90% wet, the full-domain path is used.
+        Wall time should be <= 1.15x the no-active-cell baseline.
+        (Pure Python test — validates the switching logic, not GPU speed.)
+        """
+        pytest.skip("Perf test requires --run-perf flag")

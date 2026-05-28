@@ -636,11 +636,15 @@ int gpu_domain_map_arrays(struct gpu_domain *GD) {
     // 0 here so that re-mapped gpu_domain structs never inherit stale state from
     // a previous run (Issue 8: struct field was previously left uninitialised).
     // The Python layer calls enable_active_cells() after map_arrays to opt in.
-    GD->use_active_cells   = 0;
-    GD->active_list_mapped = 0;
-    GD->active_cell_flags  = NULL;
-    GD->D.active_cell_ids  = NULL;
-    GD->D.n_active_cells   = 0;
+    GD->use_active_cells        = 0;
+    GD->active_list_mapped      = 0;
+    GD->active_cell_flags       = NULL;
+    GD->D.active_cell_ids       = NULL;
+    GD->D.n_active_cells        = 0;
+    // Dynamic wet-fraction threshold: gating switches off above this value
+    // to avoid scatter-gather overhead exceeding the work saved.
+    GD->wet_fraction_threshold  = 0.60f;
+    GD->active_cells_gating_on  = 0;
 
     if (GD->rank == 0 && GD->verbose) {
         printf("  Arrays mapped to device %d\n", GD->device_id);

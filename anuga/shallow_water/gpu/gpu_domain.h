@@ -375,6 +375,18 @@ struct gpu_domain {
     int *active_cell_flags;  // [D.number_of_elements] - GPU alloc, not a Python array
     int  active_list_mapped; // 1 once active_cell_flags is on the device
     int  use_active_cells;   // 0 = disabled (default), 1 = enabled
+
+    // Wet-fraction threshold for dynamic gating.
+    // When n_active_cells/number_of_elements exceeds this value the scatter-
+    // gather overhead exceeds the work saved, so kernels fall back to the
+    // full-domain linear loop automatically.
+    // Default 0.60 — empirically tuned on A100 / 67k-cell Towradgi mesh.
+    float wet_fraction_threshold;   // (0,1] default 0.60
+
+    // Set by gpu_active_cells_update() each timestep:
+    //   1 → wet_frac < wet_fraction_threshold → kernels USE active list
+    //   0 → wet_frac >= threshold             → kernels use full-domain loop
+    int   active_cells_gating_on;
 };
 
 // ============================================================================

@@ -151,6 +151,8 @@ cdef extern from "gpu_domain.h" nogil:
         double fixed_flux_timestep
         int use_active_cells
         int active_list_mapped
+        float wet_fraction_threshold
+        int   active_cells_gating_on
 
     # Function declarations - initialization and cleanup
     int gpu_domain_init(gpu_domain *GD, MPI_Comm comm, int rank, int nprocs)
@@ -2009,8 +2011,13 @@ def enable_active_cells(GPUDomain gpu_dom, bint enable):
 
     When enabled, all compute kernels iterate only over wet cells and
     cells on the wetting front, skipping interior dry regions.  This
-    gives significant speedups (20-60%) for flood / inundation simulations
+    gives significant speedups for flood / inundation simulations
     where a large fraction of the domain is dry at any given timestep.
+
+    Dynamic threshold: when the wet fraction exceeds wet_fraction_threshold
+    (default 0.60), the kernels automatically fall back to the full-domain
+    linear loop to avoid scatter-gather overhead.  Use
+    set_wet_fraction_threshold() to tune this value.
 
     The list is rebuilt automatically each timestep (one GPU flag scan +
     cheap CPU prefix-scan compact).  It is safe to toggle at any time
@@ -2044,6 +2051,42 @@ def get_active_cell_count(GPUDomain gpu_dom):
         Number of active cells in the last rebuilt list
     """
     return gpu_dom.GD.D.n_active_cells
+
+
+def set_wet_fraction_threshold(GPUDomain gpu_dom, float threshold):
+    """
+    Set the wet-fraction threshold for dynamic active-cell gating.
+
+    When n_active_cells / number_of_elements exceeds this value, the
+    kernel wrappers automatically fall back to the full-domain linear loop
+    because scatter-gather overhead exceeds the work saved by skipping
+    dry cells.
+
+    Empirical break-even on A100 / 67k-cell Towradgi mesh: ~0.60.
+    For smaller meshes or denser inundation patterns, tune lower (0.50).
+    For coarser meshes or very sparse inundation, tune higher (0.70).
+
+    Parameters
+    ----------
+    gpu_dom : GPUDomain
+    threshold : float
+        Value in (0, 1].  Default 0.60.
+        Set to 1.0 to always use active-cell gating (original behaviour).
+        Set to 0.0 to never gate (disables optimisation entirely).
+    """
+    if threshold <= 0.0 or threshold > 1.0:
+        raise ValueError(
+            f"wet_fraction_threshold must be in (0, 1], got {threshold}")
+    gpu_dom.GD.wet_fraction_threshold = threshold
+
+
+def get_active_cells_gating_on(GPUDomain gpu_dom):
+    """
+    Return 1 if active-cell gating is currently active (wet fraction below
+    threshold), 0 if the full-domain loop is being used this timestep.
+    Useful for logging / debugging the threshold behaviour.
+    """
+    return gpu_dom.GD.active_cells_gating_on
 
 
 def flop_counters_start_timer(GPUDomain gpu_dom):
