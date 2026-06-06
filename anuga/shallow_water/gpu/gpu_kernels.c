@@ -63,11 +63,17 @@ double gpu_compute_fluxes_substep(struct gpu_domain *GD,
 
 void gpu_update_conserved_quantities(struct gpu_domain *GD, double timestep) {
     NVTX_PUSH("gpu_update_conserved_quantities");
-    // Temporarily mask active_cell_ids when wet fraction exceeds threshold so
-    // core kernel falls back to the faster full-domain linear loop.
-    ACTIVE_GATE_BEGIN(GD)
+    // Dynamic gating: when wet fraction >= wet_fraction_threshold null the
+    // active list so core kernel uses the faster full-domain linear loop.
+    int  *_saved_act_ids_ucq = GD->D.active_cell_ids;
+    int   _saved_n_act_ucq   = GD->D.n_active_cells;
+    if (GD->use_active_cells && !GD->active_cells_gating_on) {
+        GD->D.active_cell_ids = NULL;
+        GD->D.n_active_cells  = 0;
+    }
     core_update_conserved_quantities(&GD->D, timestep);
-    ACTIVE_GATE_END(GD)
+    GD->D.active_cell_ids = _saved_act_ids_ucq;
+    GD->D.n_active_cells  = _saved_n_act_ucq;
 
     // Count FLOPs: 21 FLOPs per element (explicit + semi-implicit update).
     // When active-cell gating is enabled, charge only the cells actually
@@ -127,7 +133,8 @@ void gpu_saxpy3_conserved_quantities(struct gpu_domain *GD, double a, double b, 
 double gpu_protect(struct gpu_domain *GD) {
     NVTX_PUSH("gpu_protect");
     // gpu_protect always runs full-domain (it runs BEFORE gpu_active_cells_update).
-    // Do NOT apply ACTIVE_GATE_BEGIN here — active_cell_ids is stale at this point.
+    // NOTE: gpu_protect runs BEFORE gpu_active_cells_update — active list is stale here.
+    //       Always iterate the full domain; no gating applied.
     double mass_error = core_protect(&GD->D);
 
     // Count FLOPs: core_protect runs two passes:
@@ -176,9 +183,15 @@ double gpu_compute_water_volume(struct gpu_domain *GD) {
 
 void gpu_manning_friction(struct gpu_domain *GD) {
     NVTX_PUSH("gpu_manning_friction");
-    ACTIVE_GATE_BEGIN(GD)
+    int  *_saved_act_ids_mf = GD->D.active_cell_ids;
+    int   _saved_n_act_mf   = GD->D.n_active_cells;
+    if (GD->use_active_cells && !GD->active_cells_gating_on) {
+        GD->D.active_cell_ids = NULL;
+        GD->D.n_active_cells  = 0;
+    }
     core_manning_friction_flat_semi_implicit(&GD->D);
-    ACTIVE_GATE_END(GD)
+    GD->D.active_cell_ids = _saved_act_ids_mf;
+    GD->D.n_active_cells  = _saved_n_act_mf;
 
     // Count FLOPs: 15 FLOPs per element (sqrt, cbrt, semi-implicit).
     // Charge only active cells when gating is enabled.
@@ -192,27 +205,6 @@ void gpu_manning_friction(struct gpu_domain *GD) {
     }
     NVTX_POP();
 }
-
-// ---------------------------------------------------------------------------
-// ACTIVE-CELL GATING HELPER MACRO
-// The core_* kernels check D->active_cell_ids != NULL to decide whether to
-// use the active list.  When the dynamic threshold says gating is off (wet
-// fraction >= wet_fraction_threshold) we temporarily null the pointer before
-// calling the core kernel and restore it after.  This is safe because:
-//   1. The pointer itself is never freed here — only the local view is masked.
-//   2. All wrapper calls happen on rank-0 thread; no concurrent access.
-// ---------------------------------------------------------------------------
-#define ACTIVE_GATE_BEGIN(GD)                          \
-    int  *_saved_act_ids = (GD)->D.active_cell_ids;   \
-    int   _saved_n_act   = (GD)->D.n_active_cells;    \
-    if ((GD)->use_active_cells && !(GD)->active_cells_gating_on) { \
-        (GD)->D.active_cell_ids = NULL;                \
-        (GD)->D.n_active_cells  = 0;                  \
-    }
-
-#define ACTIVE_GATE_END(GD)                            \
-    (GD)->D.active_cell_ids = _saved_act_ids;         \
-    (GD)->D.n_active_cells  = _saved_n_act;
 
 // ============================================================================
 // Fused extrapolate + flux GPU wrapper
