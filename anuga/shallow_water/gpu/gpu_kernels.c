@@ -221,10 +221,14 @@ double gpu_extrapolate_and_compute_fluxes_substep(struct gpu_domain *GD,
         &GD->D, substep_count, timestep_fluxcalls, compute_timestep, compute_boundary_flux);
 
     if (GD->flops.enabled) {
-        uint64_t n = (uint64_t)GD->D.number_of_elements;
-        // Charge both extrapolation and flux FLOPs in a single call
-        GD->flops.extrapolate_flops   += n * FLOPS_EXTRAPOLATE;
-        GD->flops.compute_fluxes_flops += n * FLOPS_COMPUTE_FLUXES;
+        // Charge actual cells iterated, not full domain.
+        // When active-cell gating is on, only n_active cells are processed.
+        uint64_t n_charged = (GD->use_active_cells && GD->active_cells_gating_on
+                              && GD->D.n_active_cells > 0)
+                             ? (uint64_t)GD->D.n_active_cells
+                             : (uint64_t)GD->D.number_of_elements;
+        GD->flops.extrapolate_flops   += n_charged * FLOPS_EXTRAPOLATE;
+        GD->flops.compute_fluxes_flops += n_charged * FLOPS_COMPUTE_FLUXES;
         GD->flops.extrapolate_calls++;
         GD->flops.compute_fluxes_calls++;
     }
@@ -349,6 +353,12 @@ int gpu_active_cells_update(struct gpu_domain *GD) {
 
 #ifndef CPU_ONLY_MODE
     #pragma omp target update to(act_ids[0:count])
+    // CRITICAL: sync n_active_cells into the device-side copy of struct domain.
+    // Without this, #pragma omp target regions read the STALE initial value (0 or n)
+    // because the device has its own copy of D that was only synced at map_arrays time.
+    // NVC 23.3 does not support OpenMP 5.0 pointer attachment, so we must sync
+    // every scalar field that target regions need to read from D.
+    #pragma omp target update to(GD->D.n_active_cells)
 #endif
 
     // Dynamic wet-fraction threshold: switch off scatter-gather gating when

@@ -74,7 +74,11 @@ static void core_extrapolate_impl(struct domain *D,
     // Step 1: Centroid-level initialisation.
     if (init_centroids) {
         // Full init: compute height_cv, zero dry-cell momentum, set x/y_centroid_work.
-        OMP_PARALLEL_LOOP
+        #ifdef CPU_ONLY_MODE
+        _Pragma("omp parallel for simd")
+#else
+        _Pragma("omp target teams distribute parallel for simd map(to: active_ids[0:n_iter] if(use_active))")
+#endif
         for (int ai = 0; ai < n_iter; ai++) {
             anuga_int k = use_active ? (anuga_int)active_ids[ai] : (anuga_int)ai;
             double stage = stage_cv[k];
@@ -94,7 +98,11 @@ static void core_extrapolate_impl(struct domain *D,
     } else {
         // Fused path: height_cv and dry-cell momentum already set by core_protect.
         // Only populate x/y_centroid_work from the already-correct centroid values.
-        OMP_PARALLEL_LOOP
+        #ifdef CPU_ONLY_MODE
+        _Pragma("omp parallel for simd")
+#else
+        _Pragma("omp target teams distribute parallel for simd map(to: active_ids[0:n_iter] if(use_active))")
+#endif
         for (int ai = 0; ai < n_iter; ai++) {
             anuga_int k = use_active ? (anuga_int)active_ids[ai] : (anuga_int)ai;
             x_centroid_work[k] = xmom_cv[k];
@@ -103,7 +111,11 @@ static void core_extrapolate_impl(struct domain *D,
     }
 
     // Step 2: Gradient reconstruction + edge value writes.
-    OMP_PARALLEL_LOOP
+    #ifdef CPU_ONLY_MODE
+    _Pragma("omp parallel for simd")
+#else
+    _Pragma("omp target teams distribute parallel for simd map(to: active_ids[0:n_iter] if(use_active))")
+#endif
     for (int ai = 0; ai < n_iter; ai++) {
         anuga_int k  = use_active ? (anuga_int)active_ids[ai] : (anuga_int)ai;
         anuga_int k2 = k * 2;
@@ -867,7 +879,13 @@ double core_compute_fluxes_central_substep(struct domain *D,
     #ifdef CPU_ONLY_MODE
     #pragma omp parallel for simd reduction(min:local_timestep) reduction(+:boundary_flux_sum_substep)
     #else
-    #pragma omp target teams distribute parallel for reduction(min:local_timestep) reduction(+:boundary_flux_sum_substep)
+    // NVC 23.3: explicit map() translates active_ids_flux CPU ptr to device
+    // ptr. Without this, pointer attachment (OpenMP 5.0 §2.21.7.1) silently
+    // falls back to full-domain iteration in NVC <25.x.
+    #pragma omp target teams distribute parallel for \
+        reduction(min:local_timestep) \
+        reduction(+:boundary_flux_sum_substep) \
+        map(to: active_ids_flux[0:n_iter_flux] if(use_active_flux))
     #endif
     for (int ai = 0; ai < n_iter_flux; ai++) {
         anuga_int k = use_active_flux ? (anuga_int)active_ids_flux[ai] : (anuga_int)ai;
