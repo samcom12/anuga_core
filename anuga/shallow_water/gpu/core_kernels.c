@@ -71,16 +71,23 @@ static void core_extrapolate_impl(struct domain *D,
     int use_active = (active_ids != NULL) && (n_active > 0);
     int n_iter = use_active ? n_active : (int)n;
 
+    // NVC 23.3: map() requires a valid pointer+length regardless of
+    // use_active ('if' modifier on map clauses is invalid OpenMP syntax).
+    // When gating is off, map a harmless 1-element dummy instead of NULL.
+    static int _ac_dummy_extrap = 0;
+    int *active_ids_map = use_active ? active_ids : &_ac_dummy_extrap;
+    int  n_map          = use_active ? n_iter     : 1;
+
     // Step 1: Centroid-level initialisation.
     if (init_centroids) {
         // Full init: compute height_cv, zero dry-cell momentum, set x/y_centroid_work.
         #ifdef CPU_ONLY_MODE
         _Pragma("omp parallel for simd")
 #else
-        _Pragma("omp target teams distribute parallel for simd map(to: active_ids[0:n_iter] if(use_active))")
+        _Pragma("omp target teams distribute parallel for simd map(to: active_ids_map[0:n_map])")
 #endif
         for (int ai = 0; ai < n_iter; ai++) {
-            anuga_int k = use_active ? (anuga_int)active_ids[ai] : (anuga_int)ai;
+            anuga_int k = use_active ? (anuga_int)active_ids_map[ai] : (anuga_int)ai;
             double stage = stage_cv[k];
             double bed   = bed_cv[k];
             double xmom  = xmom_cv[k];
@@ -101,10 +108,10 @@ static void core_extrapolate_impl(struct domain *D,
         #ifdef CPU_ONLY_MODE
         _Pragma("omp parallel for simd")
 #else
-        _Pragma("omp target teams distribute parallel for simd map(to: active_ids[0:n_iter] if(use_active))")
+        _Pragma("omp target teams distribute parallel for simd map(to: active_ids_map[0:n_map])")
 #endif
         for (int ai = 0; ai < n_iter; ai++) {
-            anuga_int k = use_active ? (anuga_int)active_ids[ai] : (anuga_int)ai;
+            anuga_int k = use_active ? (anuga_int)active_ids_map[ai] : (anuga_int)ai;
             x_centroid_work[k] = xmom_cv[k];
             y_centroid_work[k] = ymom_cv[k];
         }
@@ -114,10 +121,10 @@ static void core_extrapolate_impl(struct domain *D,
     #ifdef CPU_ONLY_MODE
     _Pragma("omp parallel for simd")
 #else
-    _Pragma("omp target teams distribute parallel for simd map(to: active_ids[0:n_iter] if(use_active))")
+    _Pragma("omp target teams distribute parallel for simd map(to: active_ids_map[0:n_map])")
 #endif
     for (int ai = 0; ai < n_iter; ai++) {
-        anuga_int k  = use_active ? (anuga_int)active_ids[ai] : (anuga_int)ai;
+        anuga_int k  = use_active ? (anuga_int)active_ids_map[ai] : (anuga_int)ai;
         anuga_int k2 = k * 2;
         anuga_int k3 = k * 3;
         anuga_int k6 = k * 6;
@@ -875,6 +882,12 @@ double core_compute_fluxes_central_substep(struct domain *D,
     int    use_active_flux = (active_ids_flux != NULL) && (n_active_flux > 0);
     int    n_iter_flux = use_active_flux ? n_active_flux : (int)n;
 
+    // NVC 23.3: map() needs a valid pointer+length even when gating is off
+    // ('if' modifier on map clauses is not valid OpenMP syntax).
+    static int _ac_dummy_flux = 0;
+    int *active_ids_flux_map = use_active_flux ? active_ids_flux : &_ac_dummy_flux;
+    int  n_map_flux          = use_active_flux ? n_iter_flux     : 1;
+
     // Main flux computation loop with reductions
     #ifdef CPU_ONLY_MODE
     #pragma omp parallel for simd reduction(min:local_timestep) reduction(+:boundary_flux_sum_substep)
@@ -885,10 +898,10 @@ double core_compute_fluxes_central_substep(struct domain *D,
     #pragma omp target teams distribute parallel for \
         reduction(min:local_timestep) \
         reduction(+:boundary_flux_sum_substep) \
-        map(to: active_ids_flux[0:n_iter_flux] if(use_active_flux))
+        map(to: active_ids_flux_map[0:n_map_flux])
     #endif
     for (int ai = 0; ai < n_iter_flux; ai++) {
-        anuga_int k = use_active_flux ? (anuga_int)active_ids_flux[ai] : (anuga_int)ai;
+        anuga_int k = use_active_flux ? (anuga_int)active_ids_flux_map[ai] : (anuga_int)ai;
         double edgeflux[3];
         double ql[3], qr[3];
         double speed_max_last = 0.0;
