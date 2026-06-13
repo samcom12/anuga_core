@@ -323,6 +323,25 @@ int gpu_active_cells_update(struct gpu_domain *GD) {
         }
     }
 
+    // Amortised rebuild: skip the O(n) scan + D2H/host-compact/H2D round trip
+    // on (K-1) out of every K calls. The previous rebuild's active_cell_ids /
+    // n_active_cells / active_cells_gating_on remain in effect unchanged --
+    // identical in spirit to the existing "one-step lag" already documented
+    // at the gpu_evolve_one_rk2_step call site, just extended to K steps.
+    //
+    // K=1 (default) takes this branch on every call with counter==0, so the
+    // rebuild below always runs -- byte-for-byte original behaviour.
+    {
+        int K = GD->active_cells_rebuild_interval;
+        if (K < 1) K = 1;
+        int c = GD->active_cells_step_counter;
+        if (c != 0) {
+            GD->active_cells_step_counter = (c + 1) % K;
+            return GD->D.n_active_cells;
+        }
+        GD->active_cells_step_counter = (K > 1) ? 1 : 0;
+    }
+
     anuga_int n   = GD->D.number_of_elements;
     double    mah = GD->D.minimum_allowed_height;
     (void)mah;  // used indirectly through core_update_active_cell_list

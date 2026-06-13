@@ -645,6 +645,10 @@ int gpu_domain_map_arrays(struct gpu_domain *GD) {
     // to avoid scatter-gather overhead exceeding the work saved.
     GD->wet_fraction_threshold  = 0.60f;
     GD->active_cells_gating_on  = 0;
+    // Amortised list rebuild: K=1 reproduces the original every-step
+    // behaviour exactly. Opt into K>1 via set_active_cells_rebuild_interval().
+    GD->active_cells_rebuild_interval = 1;
+    GD->active_cells_step_counter     = 0;
 
     if (GD->rank == 0 && GD->verbose) {
         printf("  Arrays mapped to device %d\n", GD->device_id);

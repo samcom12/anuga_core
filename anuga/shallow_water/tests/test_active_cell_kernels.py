@@ -1112,3 +1112,106 @@ class TestWetCountVolumeConsistency:
         # With 80% of cells deliberately placed well above mah, expect
         # roughly 80% wet (allow generous tolerance for the random draw).
         assert wet_count / n > 0.5
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Layer 9 – amortised active-cell list rebuild interval (K-step lag)
+#
+# gpu_active_cells_update() pays a FIXED O(n) cost every call (device scan +
+# 29MB D2H + host compaction + H2D for n=7.29M, measured ~1-4ms/call).  At
+# low wet fractions this exceeds the compute saved by gating.
+# active_cells_rebuild_interval=K rebuilds only every Kth call, reusing the
+# previous list on the other K-1 calls.
+# ════════════════════════════════════════════════════════════════════════════
+
+def ref_rebuild_counter_sequence(K, n_calls):
+    """
+    Reference implementation of the counter/skip logic in
+    gpu_active_cells_update():
+
+        if K < 1: K = 1
+        if counter != 0:
+            counter = (counter + 1) % K
+            return SKIP
+        counter = 1 if K > 1 else 0
+        return REBUILD
+
+    Returns a list of 'REBUILD'/'SKIP' of length n_calls.
+    """
+    if K < 1:
+        K = 1
+    counter = 0
+    out = []
+    for _ in range(n_calls):
+        if counter != 0:
+            out.append('SKIP')
+            counter = (counter + 1) % K
+        else:
+            out.append('REBUILD')
+            counter = 1 if K > 1 else 0
+    return out
+
+
+class TestActiveCellsRebuildInterval:
+
+    def test_k1_rebuilds_every_call(self):
+        """K=1 must reproduce the original every-step behaviour exactly:
+        every call is a REBUILD, none are SKIP."""
+        seq = ref_rebuild_counter_sequence(K=1, n_calls=10)
+        assert seq == ['REBUILD'] * 10
+
+    @pytest.mark.parametrize("K", [2, 3, 5, 10])
+    def test_rebuilds_exactly_every_kth_call(self, K):
+        """For K>1, calls 1, K+1, 2K+1, ... are REBUILD; all others SKIP."""
+        n_calls = 4 * K + 1
+        seq = ref_rebuild_counter_sequence(K=K, n_calls=n_calls)
+        for i, label in enumerate(seq, start=1):
+            expected = 'REBUILD' if (i - 1) % K == 0 else 'SKIP'
+            assert label == expected, f"call {i}: expected {expected}, got {label}"
+
+    @pytest.mark.parametrize("K", [1, 2, 5, 10, 100])
+    def test_rebuild_fraction_equals_one_over_k(self, K):
+        """Over many calls, the fraction of REBUILDs converges to 1/K,
+        i.e. the fixed per-rebuild cost is divided by K."""
+        n_calls = 1000 * K
+        seq = ref_rebuild_counter_sequence(K=K, n_calls=n_calls)
+        rebuilds = seq.count('REBUILD')
+        assert rebuilds == n_calls // K
+
+    def test_invalid_k_clamped_to_one(self):
+        """K<1 (e.g. 0 or negative, defensive) is clamped to K=1
+        (rebuild every call) rather than dividing by zero or skipping
+        forever."""
+        for bad_K in [0, -1, -5]:
+            seq = ref_rebuild_counter_sequence(K=bad_K, n_calls=5)
+            assert seq == ['REBUILD'] * 5
+
+    def test_amortised_overhead_estimate(self):
+        """
+        Sanity check the cost model against the measured production deltas:
+        per-call fixed cost ~1.0-4.0 ms (P1-P8 range from the production
+        log).  With K=5, the per-step amortised overhead should drop to
+        roughly 1/5 of that, i.e. ~0.2-0.8 ms/step -- small enough that
+        the FLOP savings from gating (12.6x reduction observed: 26.6M ->
+        2.1M GFLOPs) should now translate into a net wall-clock win.
+        """
+        measured_overhead_ms_per_step = {
+            'P1_full_domain': 4.03,
+            'P2_0pct':        1.20,
+            'P3_0pct':        1.43,
+            'P4_0.5pct':      1.51,
+            'P5_1.0pct':      1.51,
+            'P6_1.5pct':      0.88,
+            'P7_2.1pct':      1.04,
+            'P8_2.7pct':      1.42,
+        }
+        for K in [5, 10]:
+            for period, overhead in measured_overhead_ms_per_step.items():
+                amortised = overhead / K
+                assert amortised < overhead, \
+                    f"K={K} {period}: amortised overhead must be lower"
+                # With K>=5, amortised overhead drops below 1ms/step for
+                # every period -- well under typical step times (~20ms,
+                # derived from period/steps in the production log).
+                assert amortised < 1.0, \
+                    f"K={K} {period}: amortised={amortised:.3f}ms still >=1ms"

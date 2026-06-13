@@ -153,6 +153,8 @@ cdef extern from "gpu_domain.h" nogil:
         int active_list_mapped
         float wet_fraction_threshold
         int   active_cells_gating_on
+        int   active_cells_rebuild_interval
+        int   active_cells_step_counter
 
     # Function declarations - initialization and cleanup
     int gpu_domain_init(gpu_domain *GD, MPI_Comm comm, int rank, int nprocs)
@@ -2087,6 +2089,47 @@ def get_active_cells_gating_on(GPUDomain gpu_dom):
     Useful for logging / debugging the threshold behaviour.
     """
     return gpu_dom.GD.active_cells_gating_on
+
+
+def set_active_cells_rebuild_interval(GPUDomain gpu_dom, int interval):
+    """
+    Set how often the active-cell list is rebuilt, in RK2/RK3 steps.
+
+    gpu_active_cells_update() does an O(n) device classification scan plus
+    a D2H transfer + host-side compaction + H2D transfer of the active list
+    -- a FIXED per-call cost (~1-4 ms for n~7M) independent of how many
+    cells are actually active.  At low wet fractions (a few percent), this
+    fixed cost can exceed the compute saved by skipping those cells in
+    extrapolate/flux, making gating a net loss in wall-clock time even
+    though it correctly reduces FLOP counts.
+
+    Setting interval=K rebuilds the list every Kth call and reuses the
+    previous list unchanged on the other (K-1) calls, dividing the fixed
+    cost by K.  This is a direct extension of the existing "one-step lag"
+    tolerance (wetting-front neighbour inclusion already absorbs cells that
+    become wet between rebuilds; this just allows that lag to be K steps
+    instead of 1), and remains conservative w.r.t. CFL.
+
+    Parameters
+    ----------
+    gpu_dom : GPUDomain
+    interval : int
+        K >= 1. K=1 (default) rebuilds every step -- original behaviour,
+        byte-for-byte. K=5-10 is a reasonable starting point for
+        low-wet-fraction domains (e.g. Mahanadi Delta at 0-3% wet) where
+        the per-step rebuild overhead was measured to exceed the gating
+        benefit at K=1.
+    """
+    if interval < 1:
+        raise ValueError(
+            f"active_cells_rebuild_interval must be >= 1, got {interval}")
+    gpu_dom.GD.active_cells_rebuild_interval = interval
+    gpu_dom.GD.active_cells_step_counter = 0  # restart the cycle cleanly
+
+
+def get_active_cells_rebuild_interval(GPUDomain gpu_dom):
+    """Return the current active-cell list rebuild interval K."""
+    return gpu_dom.GD.active_cells_rebuild_interval
 
 
 def flop_counters_start_timer(GPUDomain gpu_dom):

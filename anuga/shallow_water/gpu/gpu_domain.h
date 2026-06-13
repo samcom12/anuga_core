@@ -387,6 +387,11 @@ struct gpu_domain {
     //   1 → wet_frac < wet_fraction_threshold → kernels USE active list
     //   0 → wet_frac >= threshold             → kernels use full-domain loop
     int   active_cells_gating_on;
+
+    // Amortised list rebuild (K >= 1, default 1 = every-step, original behaviour).
+    // See gpu_active_cells_update() for the cost/benefit rationale.
+    int   active_cells_rebuild_interval;
+    int   active_cells_step_counter;
 };
 
 // ============================================================================
