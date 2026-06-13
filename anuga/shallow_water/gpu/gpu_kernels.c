@@ -80,8 +80,7 @@ void gpu_update_conserved_quantities(struct gpu_domain *GD, double timestep) {
     // iterated; charging number_of_elements over-reports GFLOP/s by the
     // inverse of the wet fraction and makes Gordon Bell numbers wrong.
     if (GD->flops.enabled) {
-        int n_charged = (GD->use_active_cells && GD->active_cells_gating_on
-                         && GD->D.n_active_cells > 0)
+        int n_charged = (GD->use_active_cells && GD->active_cells_gating_on)
                         ? GD->D.n_active_cells
                         : (int)GD->D.number_of_elements;
         GD->flops.update_flops += (uint64_t)n_charged * FLOPS_UPDATE;
@@ -143,8 +142,7 @@ double gpu_protect(struct gpu_domain *GD) {
     // Charge accordingly so the FLOP/s figure is not inflated.
     if (GD->flops.enabled) {
         anuga_int n = GD->D.number_of_elements;
-        int n_pass2 = (GD->use_active_cells && GD->active_cells_gating_on
-                       && GD->D.n_active_cells > 0)
+        int n_pass2 = (GD->use_active_cells && GD->active_cells_gating_on)
                       ? GD->D.n_active_cells
                       : (int)n;
         // FLOPS_PROTECT covers both passes; split evenly (1 FLOP/cell each pass)
@@ -196,8 +194,7 @@ void gpu_manning_friction(struct gpu_domain *GD) {
     // Count FLOPs: 15 FLOPs per element (sqrt, cbrt, semi-implicit).
     // Charge only active cells when gating is enabled.
     if (GD->flops.enabled) {
-        int n_charged = (GD->use_active_cells && GD->active_cells_gating_on
-                         && GD->D.n_active_cells > 0)
+        int n_charged = (GD->use_active_cells && GD->active_cells_gating_on)
                         ? GD->D.n_active_cells
                         : (int)GD->D.number_of_elements;
         GD->flops.manning_flops += (uint64_t)n_charged * FLOPS_MANNING;
@@ -223,8 +220,7 @@ double gpu_extrapolate_and_compute_fluxes_substep(struct gpu_domain *GD,
     if (GD->flops.enabled) {
         // Charge actual cells iterated, not full domain.
         // When active-cell gating is on, only n_active cells are processed.
-        uint64_t n_charged = (GD->use_active_cells && GD->active_cells_gating_on
-                              && GD->D.n_active_cells > 0)
+        uint64_t n_charged = (GD->use_active_cells && GD->active_cells_gating_on)
                              ? (uint64_t)GD->D.n_active_cells
                              : (uint64_t)GD->D.number_of_elements;
         GD->flops.extrapolate_flops   += n_charged * FLOPS_EXTRAPOLATE;

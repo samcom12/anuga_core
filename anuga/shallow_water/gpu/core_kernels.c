@@ -68,7 +68,7 @@ static void core_extrapolate_impl(struct domain *D,
     double * restrict x_centroid_work = D->x_centroid_work;
     double * restrict y_centroid_work = D->y_centroid_work;
 
-    int use_active = (active_ids != NULL) && (n_active > 0);
+    int use_active = (active_ids != NULL);
     int n_iter = use_active ? n_active : (int)n;
 
     // NVC 23.3: map() requires a valid pointer+length regardless of
@@ -438,12 +438,21 @@ void core_update_conserved_quantities(struct domain *D, double timestep) {
     // Active cell support: iterate only over wet + wetting-front cells when enabled.
     int    n_active_ucq = D->n_active_cells;
     int  * active_ids_ucq = D->active_cell_ids;
-    int    use_active_ucq = (active_ids_ucq != NULL) && (n_active_ucq > 0);
+    int    use_active_ucq = (active_ids_ucq != NULL);
     int    n_iter_ucq = use_active_ucq ? n_active_ucq : (int)n;
 
-    OMP_PARALLEL_LOOP
+    // NVC 23.3: map() needs a valid pointer+length (no 'if' modifier allowed).
+    static int _ac_dummy_ucq = 0;
+    int *active_ids_ucq_map = use_active_ucq ? active_ids_ucq : &_ac_dummy_ucq;
+    int  n_map_ucq          = use_active_ucq ? n_iter_ucq     : 1;
+
+#ifdef CPU_ONLY_MODE
+    _Pragma("omp parallel for simd")
+#else
+    _Pragma("omp target teams distribute parallel for simd map(to: active_ids_ucq_map[0:n_map_ucq])")
+#endif
     for (int ai = 0; ai < n_iter_ucq; ai++) {
-        anuga_int k = use_active_ucq ? (anuga_int)active_ids_ucq[ai] : (anuga_int)ai;
+        anuga_int k = use_active_ucq ? (anuga_int)active_ids_ucq_map[ai] : (anuga_int)ai;
         // Get current centroid values
         double stage_c = stage_cv[k];
         double xmom_c = xmom_cv[k];
@@ -499,12 +508,21 @@ void core_backup_conserved_quantities(struct domain *D) {
     // For a typical 40-60 % dry fraction this halves the HBM traffic on this kernel.
     int    n_active_bk = D->n_active_cells;
     int  * active_ids_bk = D->active_cell_ids;
-    int    use_active_bk = (active_ids_bk != NULL) && (n_active_bk > 0);
+    int    use_active_bk = (active_ids_bk != NULL);
     int    n_iter_bk = use_active_bk ? n_active_bk : (int)n;
 
-    OMP_PARALLEL_LOOP
+    // NVC 23.3: map() needs a valid pointer+length (no 'if' modifier allowed).
+    static int _ac_dummy_bk = 0;
+    int *active_ids_bk_map = use_active_bk ? active_ids_bk : &_ac_dummy_bk;
+    int  n_map_bk          = use_active_bk ? n_iter_bk     : 1;
+
+#ifdef CPU_ONLY_MODE
+    _Pragma("omp parallel for simd")
+#else
+    _Pragma("omp target teams distribute parallel for simd map(to: active_ids_bk_map[0:n_map_bk])")
+#endif
     for (int ai = 0; ai < n_iter_bk; ai++) {
-        anuga_int k = use_active_bk ? (anuga_int)active_ids_bk[ai] : (anuga_int)ai;
+        anuga_int k = use_active_bk ? (anuga_int)active_ids_bk_map[ai] : (anuga_int)ai;
         stage_bk[k] = stage_cv[k];
         xmom_bk[k]  = xmom_cv[k];
         ymom_bk[k]  = ymom_cv[k];
@@ -535,12 +553,21 @@ void core_saxpy_conserved_quantities(struct domain *D, double a, double b, doubl
     // for those cells is also 0 — so they don't need to be touched.
     int    n_active_sx = D->n_active_cells;
     int  * active_ids_sx = D->active_cell_ids;
-    int    use_active_sx = (active_ids_sx != NULL) && (n_active_sx > 0);
+    int    use_active_sx = (active_ids_sx != NULL);
     int    n_iter_sx = use_active_sx ? n_active_sx : (int)n;
 
-    OMP_PARALLEL_LOOP
+    // NVC 23.3: map() needs a valid pointer+length (no 'if' modifier allowed).
+    static int _ac_dummy_sx = 0;
+    int *active_ids_sx_map = use_active_sx ? active_ids_sx : &_ac_dummy_sx;
+    int  n_map_sx          = use_active_sx ? n_iter_sx     : 1;
+
+#ifdef CPU_ONLY_MODE
+    _Pragma("omp parallel for simd")
+#else
+    _Pragma("omp target teams distribute parallel for simd map(to: active_ids_sx_map[0:n_map_sx])")
+#endif
     for (int ai = 0; ai < n_iter_sx; ai++) {
-        anuga_int k = use_active_sx ? (anuga_int)active_ids_sx[ai] : (anuga_int)ai;
+        anuga_int k = use_active_sx ? (anuga_int)active_ids_sx_map[ai] : (anuga_int)ai;
         double stage = (a * stage_cv[k] + b * stage_bk[k]) * scale;
 
         stage_cv[k]  = stage;
@@ -583,12 +610,21 @@ double core_protect(struct domain *D) {
     // Pass 2: momentum zeroing + mass-error (active-cell aware)
     int    n_active_prot = D->n_active_cells;
     int  * active_ids_prot = D->active_cell_ids;
-    int    use_active_prot = (active_ids_prot != NULL) && (n_active_prot > 0);
+    int    use_active_prot = (active_ids_prot != NULL);
     int    n_iter_prot = use_active_prot ? n_active_prot : (int)n;
 
-    OMP_PARALLEL_LOOP_REDUCTION_PLUS(mass_error)
+    // NVC 23.3: map() needs a valid pointer+length (no 'if' modifier allowed).
+    static int _ac_dummy_prot = 0;
+    int *active_ids_prot_map = use_active_prot ? active_ids_prot : &_ac_dummy_prot;
+    int  n_map_prot          = use_active_prot ? n_iter_prot     : 1;
+
+#ifdef CPU_ONLY_MODE
+    _Pragma("omp parallel for simd reduction(+:mass_error)")
+#else
+    _Pragma("omp target teams distribute parallel for reduction(+:mass_error) map(to: active_ids_prot_map[0:n_map_prot])")
+#endif
     for (int ai = 0; ai < n_iter_prot; ai++) {
-        anuga_int k = use_active_prot ? (anuga_int)active_ids_prot[ai] : (anuga_int)ai;
+        anuga_int k = use_active_prot ? (anuga_int)active_ids_prot_map[ai] : (anuga_int)ai;
         double h = height_cv[k];  // already refreshed in Pass 1
 
         if (h < minimum_allowed_height) {
@@ -659,12 +695,21 @@ void core_manning_friction_flat_semi_implicit(struct domain *D) {
     // Active cell support: iterate only over wet + wetting-front cells when enabled.
     int    n_active_mf = D->n_active_cells;
     int  * active_ids_mf = D->active_cell_ids;
-    int    use_active_mf = (active_ids_mf != NULL) && (n_active_mf > 0);
+    int    use_active_mf = (active_ids_mf != NULL);
     int    n_iter_mf = use_active_mf ? n_active_mf : (int)n;
 
-    OMP_PARALLEL_LOOP
+    // NVC 23.3: map() needs a valid pointer+length (no 'if' modifier allowed).
+    static int _ac_dummy_mf = 0;
+    int *active_ids_mf_map = use_active_mf ? active_ids_mf : &_ac_dummy_mf;
+    int  n_map_mf          = use_active_mf ? n_iter_mf     : 1;
+
+#ifdef CPU_ONLY_MODE
+    _Pragma("omp parallel for simd")
+#else
+    _Pragma("omp target teams distribute parallel for simd map(to: active_ids_mf_map[0:n_map_mf])")
+#endif
     for (int ai = 0; ai < n_iter_mf; ai++) {
-        anuga_int k = use_active_mf ? (anuga_int)active_ids_mf[ai] : (anuga_int)ai;
+        anuga_int k = use_active_mf ? (anuga_int)active_ids_mf_map[ai] : (anuga_int)ai;
         double S = 0.0;
         double uh  = xmom_cv[k];
         double vh  = ymom_cv[k];
@@ -709,12 +754,21 @@ void core_manning_friction_sloped_semi_implicit(struct domain *D) {
     // (Previously iterated unconditionally over 0..n.)
     int    n_active_ms = D->n_active_cells;
     int  * active_ids_ms = D->active_cell_ids;
-    int    use_active_ms = (active_ids_ms != NULL) && (n_active_ms > 0);
+    int    use_active_ms = (active_ids_ms != NULL);
     int    n_iter_ms = use_active_ms ? n_active_ms : (int)n;
 
-    OMP_PARALLEL_LOOP
+    // NVC 23.3: map() needs a valid pointer+length (no 'if' modifier allowed).
+    static int _ac_dummy_ms = 0;
+    int *active_ids_ms_map = use_active_ms ? active_ids_ms : &_ac_dummy_ms;
+    int  n_map_ms          = use_active_ms ? n_iter_ms     : 1;
+
+#ifdef CPU_ONLY_MODE
+    _Pragma("omp parallel for simd")
+#else
+    _Pragma("omp target teams distribute parallel for simd map(to: active_ids_ms_map[0:n_map_ms])")
+#endif
     for (int ai = 0; ai < n_iter_ms; ai++) {
-        anuga_int k = use_active_ms ? (anuga_int)active_ids_ms[ai] : (anuga_int)ai;
+        anuga_int k = use_active_ms ? (anuga_int)active_ids_ms_map[ai] : (anuga_int)ai;
         double h = height_cv[k];
 
         if (h > minimum_allowed_height) {
@@ -879,7 +933,7 @@ double core_compute_fluxes_central_substep(struct domain *D,
     // Active cell support: iterate only over wet + wetting-front cells when enabled.
     int    n_active_flux = D->n_active_cells;
     int  * active_ids_flux = D->active_cell_ids;
-    int    use_active_flux = (active_ids_flux != NULL) && (n_active_flux > 0);
+    int    use_active_flux = (active_ids_flux != NULL);
     int    n_iter_flux = use_active_flux ? n_active_flux : (int)n;
 
     // NVC 23.3: map() needs a valid pointer+length even when gating is off

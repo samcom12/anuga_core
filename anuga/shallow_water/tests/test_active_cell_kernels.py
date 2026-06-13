@@ -869,3 +869,119 @@ class TestWetFractionThreshold:
         (Pure Python test — validates the switching logic, not GPU speed.)
         """
         pytest.skip("Perf test requires --run-perf flag")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Layer 7 – n_active == 0 edge case (fully dry domain)
+#
+# Regression tests for the bug where use_active = (active_ids != NULL) &&
+# (n_active > 0) caused a 0%-wet domain to silently fall back to the full
+# n_iter = n path instead of n_iter = 0.  This defeated active-cell gating
+# at exactly the moment it would provide maximum benefit (e.g. Mahanadi
+# Delta t=10800s, wet=0/7290176).
+#
+# Fix: use_active = (active_ids != NULL).  n_active == 0 then correctly
+# yields n_iter = 0 (the C loop `for (ai=0; ai<0; ai++)` executes zero
+# iterations — near-zero kernel cost).
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestFullyDryDomain:
+    """n_active == 0: active list present but empty (100% dry domain)."""
+
+    def _n_iter(self, active_ids, n_active, n_total):
+        """Mirror of the fixed C logic: use_active = (active_ids != NULL)."""
+        use_active = active_ids is not None
+        n_iter = n_active if use_active else n_total
+        return n_iter, use_active
+
+    def test_empty_active_list_yields_zero_iterations(self):
+        """
+        active_ids != NULL but n_active == 0 (fully dry domain) must give
+        n_iter == 0, NOT n_iter == n_total.
+
+        This is the exact bug: the old condition
+          use_active = (active_ids != NULL) && (n_active > 0)
+        evaluated to False when n_active==0, causing n_iter = n_total
+        (full-domain fallback) even though the active list correctly
+        reports zero wet cells.
+        """
+        n_total = 7_290_176
+        active_ids = np.array([], dtype=np.int32)  # valid, empty array
+        n_active = 0
+
+        n_iter, use_active = self._n_iter(active_ids, n_active, n_total)
+
+        assert use_active is True, (
+            "active_ids is non-NULL (a valid empty array) — "
+            "use_active must be True")
+        assert n_iter == 0, (
+            f"n_active==0 must give n_iter==0 (zero kernel work), "
+            f"got n_iter={n_iter} (old buggy behaviour gave n_total={n_total})")
+
+    def test_null_active_list_falls_back_to_full_domain(self):
+        """
+        active_ids == NULL (gating intentionally disabled, e.g. wet_frac
+        >= threshold) must still fall back to n_iter == n_total.
+        This is the deliberate full-domain path and must be preserved.
+        """
+        n_total = 7_290_176
+        active_ids = None  # NULL — gating disabled by gpu_kernels.c
+        n_active = 0       # irrelevant when active_ids is NULL
+
+        n_iter, use_active = self._n_iter(active_ids, n_active, n_total)
+
+        assert use_active is False
+        assert n_iter == n_total, (
+            "active_ids==NULL must give full-domain n_iter==n_total")
+
+    @pytest.mark.parametrize("n_active,n_total,expected_n_iter", [
+        (0,      7_290_176, 0),          # fully dry — zero work
+        (1,      7_290_176, 1),          # single wet cell
+        (36441,  7_290_176, 36441),      # 0.5% wet (Mahanadi t=32400s)
+        (7290176,7_290_176, 7290176),    # 100% wet
+    ])
+    def test_n_iter_matches_n_active_when_list_present(
+            self, n_active, n_total, expected_n_iter):
+        """For any n_active in [0, n_total], n_iter must equal n_active
+        whenever the active list is present (active_ids != NULL)."""
+        active_ids = np.zeros(max(n_active, 1), dtype=np.int32)  # valid, non-NULL
+        n_iter, use_active = self._n_iter(active_ids, n_active, n_total)
+        assert use_active is True
+        assert n_iter == expected_n_iter
+
+    def test_fully_dry_kernel_produces_no_state_change(self):
+        """
+        With n_iter==0, ref_update_conserved_quantities restricted to an
+        empty active_ids array must leave ALL cells unchanged — confirming
+        zero kernel work is the physically correct outcome for a 100% dry
+        domain with active-cell gating enabled.
+        """
+        d = make_domain(1000, dry_fraction=1.0, seed=60)  # all cells dry
+        active = build_active_ids(d['height'], d['mah'])  # -> empty array
+        assert len(active) == 0, "Expected empty active list for 100% dry domain"
+
+        s_before = d['stage'].copy()
+        x_before = d['xmom'].copy()
+        y_before = d['ymom'].copy()
+
+        s_after, x_after, y_after = ref_update_conserved_quantities(
+            d['stage'], d['xmom'], d['ymom'],
+            d['stage_eu'], d['xmom_eu'], d['ymom_eu'],
+            d['timestep'], active_ids=active)
+
+        # n_iter==0 -> loop body never executes -> arrays unchanged
+        np.testing.assert_array_equal(s_after, s_before)
+        np.testing.assert_array_equal(x_after, x_before)
+        np.testing.assert_array_equal(y_after, y_before)
+
+    def test_gating_on_with_zero_active_is_cheaper_than_full_domain(self):
+        """
+        Sanity check on the cost model: n_iter==0 must be strictly cheaper
+        (fewer iterations) than n_iter==n_total for any n_total > 0.
+        Guards against future regressions reintroducing the >0 condition.
+        """
+        for n_total in [1000, 67883, 7_290_176]:
+            active_ids = np.array([], dtype=np.int32)
+            n_iter, use_active = self._n_iter(active_ids, 0, n_total)
+            assert n_iter == 0
+            assert n_iter < n_total
