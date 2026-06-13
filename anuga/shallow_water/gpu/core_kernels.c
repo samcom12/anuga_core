@@ -1185,7 +1185,22 @@ int core_update_active_cell_list(struct domain *D, int *active_ids) {
 
     // Pass 1: mark flag[k]=1 if cell k is wet or has a wet neighbour
     // Uses device memory (active_ids repurposed as flag scratch before compaction).
-    OMP_PARALLEL_LOOP
+    //
+    // NVC 23.3 fix: active_ids (= GD->active_cell_flags) is a function-parameter
+    // pointer to a buffer already present on device via
+    // 'target enter data map(alloc:...)' in gpu_active_cells_init. Without an
+    // explicit map() here, NVC 23.3 (no pointer attachment) uses the CPU address
+    // inside this target region, so active_ids[k]=wet writes go to the wrong
+    // location. The device-resident 'flags' buffer is then read back unchanged
+    // by 'target update from(flags[0:n])' in gpu_active_cells_update, giving
+    // count==0 (wet=0%) REGARDLESS of the true wet/dry state.
+    // map(from:...) on an already-'present' buffer is a ref-count bump (no extra
+    // allocation/copy) but performs the required pointer translation.
+#ifdef CPU_ONLY_MODE
+    _Pragma("omp parallel for simd")
+#else
+    _Pragma("omp target teams distribute parallel for simd map(from: active_ids[0:n])")
+#endif
     for (anuga_int k = 0; k < n; k++) {
         int wet = (height_cv[k] > mah);
         if (!wet) {

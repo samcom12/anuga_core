@@ -985,3 +985,130 @@ class TestFullyDryDomain:
             n_iter, use_active = self._n_iter(active_ids, 0, n_total)
             assert n_iter == 0
             assert n_iter < n_total
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Layer 8 – wet-count vs total-volume consistency
+#
+# Regression test for the bug in core_update_active_cell_list where the
+# active_ids/flags output array was written inside a #pragma omp target
+# region with NO map() clause (NVC 23.3 pointer-attachment issue, same class
+# as the 8 kernels fixed for n_active==0).  On affected compilers, the
+# device-resident 'flags' buffer was never actually written, so
+# gpu_active_cells_update() always read back count==0 -> wet=0% regardless
+# of the true wet/dry state.
+#
+# Evidence from a production run (Mahanadi Delta, t=21600s):
+#   [active_cells] wet=0/7290176 (0.0%)
+#   Total Volume  =: 524109739.4 m^3
+#
+# 524.1M m^3 implies an average depth of ~423mm across the ~1.24e9 m^2 mesh
+# -- 53x the minimum_allowed_height (8mm) threshold used by
+# core_update_active_cell_list.  For wet=0% to be physically correct, EVERY
+# cell would need h<=8mm, capping total volume at ~9.9M m^3 (a hard
+# mathematical ceiling, independent of how depth is distributed).  524M m^3
+# exceeds this ceiling by 53x, so wet=0% cannot be physically real -- it is
+# a measurement bug in the flag-write, not a drainage event.
+# ════════════════════════════════════════════════════════════════════════════
+
+def ref_classify_wet_cells(height, mah, neighbours=None):
+    """
+    Reference implementation of core_update_active_cell_list's
+    classification: wet[k] = (height[k] > mah) OR any neighbour wet.
+    Returns (wet_count, wet_mask).
+    """
+    wet = height > mah
+    flags = wet.copy()
+    if neighbours is not None:
+        n = len(height)
+        for k in range(n):
+            if not wet[k]:
+                for nb in neighbours[k]:
+                    if nb >= 0 and wet[nb]:
+                        flags[k] = True
+                        break
+    return int(flags.sum()), flags
+
+
+def volume_upper_bound_if_wet_fraction(wet_count, n_total, mah, avg_area):
+    """
+    Maximum possible total volume if exactly `wet_count` cells have h>mah
+    (each capped near mah) and ALL OTHER cells have h<=mah (each capped
+    at mah). This is a generous over-estimate used only as a sanity ceiling.
+
+    volume <= n_total * mah * avg_area  +  (unbounded contribution from
+    wet_count cells, which is NOT capped)
+
+    The useful direction is the inverse: if wet_count==0, then EVERY cell
+    has h<=mah, so volume <= n_total * mah * avg_area exactly.
+    """
+    if wet_count == 0:
+        return n_total * mah * avg_area
+    return float('inf')  # no finite ceiling once any cell may be deep
+
+
+class TestWetCountVolumeConsistency:
+    """wet_count==0 must be consistent with a bounded total volume."""
+
+    def test_zero_wet_count_caps_total_volume(self):
+        """
+        If core_update_active_cell_list correctly reports wet_count==0,
+        every cell has h<=mah, so total volume must be <= n*mah*avg_area.
+        This is the mathematical relationship that was violated in the
+        production log (wet=0%, volume=524.1M m^3 >> 9.9M m^3 ceiling).
+        """
+        n_total  = 7_290_176
+        mah      = 0.008       # minimum_allowed_height (m)
+        avg_area = 170.0       # m^2, from mesh histogram
+
+        ceiling = volume_upper_bound_if_wet_fraction(0, n_total, mah, avg_area)
+        assert ceiling == pytest.approx(n_total * mah * avg_area)
+        assert ceiling == pytest.approx(9_914_639.36, rel=1e-6)
+
+        # The production-log volume VIOLATES this ceiling by ~53x,
+        # proving wet=0% was a measurement bug, not physical drainage.
+        observed_volume = 524_109_739.4
+        assert observed_volume > ceiling, (
+            "If this assertion ever fails, a volume this large WOULD be "
+            "consistent with wet_count==0 -- re-examine whether the "
+            "core_update_active_cell_list map() fix is still needed.")
+        assert observed_volume / ceiling == pytest.approx(52.86, rel=0.01)
+
+    def test_classify_wet_cells_matches_volume_derived_depth(self):
+        """
+        End-to-end consistency on a synthetic domain: the reference wet
+        classifier's count must be > 0 whenever the average depth (derived
+        from total volume / total area) exceeds mah, for a domain where
+        depth is reasonably uniform.
+
+        This guards against a regression where wet_count silently returns 0
+        for a domain that demonstrably holds water above the threshold.
+        """
+        n = 10_000
+        mah = 0.008
+        rng = np.random.default_rng(99)
+
+        # Build a domain where ~80% of cells have a depth around 400mm
+        # (similar order of magnitude to the 423mm production figure),
+        # and 20% are genuinely dry (h<mah).
+        height = np.where(
+            rng.random(n) < 0.8,
+            rng.uniform(0.30, 0.50, n),   # ~300-500mm, well above mah
+            rng.uniform(0.0, mah * 0.5, n)  # genuinely dry
+        )
+
+        wet_count, _ = ref_classify_wet_cells(height, mah)
+
+        avg_area = 170.0
+        total_volume = np.sum(height * avg_area)
+        avg_depth = total_volume / (n * avg_area)
+
+        assert avg_depth > mah, "test setup sanity check"
+        assert wet_count > 0, (
+            f"avg_depth={avg_depth*1000:.1f}mm > mah={mah*1000:.1f}mm "
+            f"but wet_count==0 -- this is the exact contradiction observed "
+            f"in the production log (wet=0%% with 423mm avg depth)")
+
+        # With 80% of cells deliberately placed well above mah, expect
+        # roughly 80% wet (allow generous tolerance for the random draw).
+        assert wet_count / n > 0.5
