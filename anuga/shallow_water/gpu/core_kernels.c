@@ -1183,19 +1183,51 @@ int core_update_active_cell_list(struct domain *D, int *active_ids) {
     double * restrict height_cv = D->height_centroid_values;
     anuga_int * restrict neighbours = D->neighbours;
 
-    // Pass 1: mark flag[k]=1 if cell k is wet or has a wet neighbour
-    // Uses device memory (active_ids repurposed as flag scratch before compaction).
+    // Pass 1: mark flag[k]=1 if cell k is wet, OR is within TWO faces of a wet
+    // cell (a 2-ring halo around the wet region).
+    //
+    // WHY TWO RINGS AND NOT ONE (conservation requirement):
+    // The flux kernel is "pull"-based: each iterated cell k computes the flux on
+    // its own 3 edges and writes ONLY stage_explicit_update[k]. The opposite
+    // half of edge (k,N) is applied when the loop independently visits N. Mass
+    // is conserved ONLY IF, for every edge carrying non-zero flux, BOTH endpoints
+    // are iterated -- because gpu_flux_function_central is antisymmetric
+    // (flux_Nk = -flux_kN exactly), so the two one-sided writes cancel into a
+    // true face flux.
+    //
+    // A 1-ring (wet + immediate dry neighbours) is NOT closed under this stencil:
+    // the outermost ring cells are dry cells that are active only because they
+    // touch a wet cell, but THEIR outer neighbours (dry, no wet neighbour) are
+    // inactive. The edge between an outer-ring active cell and its inactive
+    // neighbour is computed from the active side only -> one-sided flux -> mass
+    // is created/destroyed at that interface. Measured leak: ~16% spurious mass
+    // in 3 h at K=1 on the 300sqm Mahanadi case (reflective, no sources).
+    //
+    // Extending to a 2-ring guarantees that every cell which actually carries
+    // flux (the wet cells and the 1-ring wetting front, where h>0) has ALL of
+    // its face-neighbours iterated too. The outer (2nd-ring) cells may still
+    // border inactive cells, but those outermost edges are dry-dry with h==0 on
+    // both sides, where gpu_flux_function_central returns exactly zero flux
+    // (the h_left==0 && h_right==0 short-circuit). Zero flux applied one-sided
+    // is still zero, so conservation holds.
+    //
+    // The SAME active_cell_ids list is consumed by the flux kernel, the
+    // extrapolation kernel, and update_conserved_quantities, so all three
+    // iterate this stencil-closed set and the integrated cells match the
+    // flux-computing cells exactly.
     //
     // NVC 23.3 fix: active_ids (= GD->active_cell_flags) is a function-parameter
     // pointer to a buffer already present on device via
     // 'target enter data map(alloc:...)' in gpu_active_cells_init. Without an
     // explicit map() here, NVC 23.3 (no pointer attachment) uses the CPU address
     // inside this target region, so active_ids[k]=wet writes go to the wrong
-    // location. The device-resident 'flags' buffer is then read back unchanged
-    // by 'target update from(flags[0:n])' in gpu_active_cells_update, giving
-    // count==0 (wet=0%) REGARDLESS of the true wet/dry state.
-    // map(from:...) on an already-'present' buffer is a ref-count bump (no extra
-    // allocation/copy) but performs the required pointer translation.
+    // location. map(from:...) on an already-'present' buffer is a ref-count bump
+    // (no extra allocation/copy) but performs the required pointer translation.
+    //
+    // Two-pass marking (1-ring then ring-of-ring) is done with a scratch read of
+    // height for ring 0/1 and a read of the ring-1 flags for ring 2. To avoid a
+    // race (reading flags while writing them) the 2nd ring is grown from a
+    // wet/near-wet predicate recomputed inline rather than from the flag array.
 #ifdef CPU_ONLY_MODE
     _Pragma("omp parallel for simd")
 #else
@@ -1204,12 +1236,27 @@ int core_update_active_cell_list(struct domain *D, int *active_ids) {
     for (anuga_int k = 0; k < n; k++) {
         int wet = (height_cv[k] > mah);
         if (!wet) {
-            // Check three neighbours for wetting front
-            for (int i = 0; i < 3; i++) {
+            // Ring 1: wet face-neighbour?
+            for (int i = 0; i < 3 && !wet; i++) {
                 anuga_int nb = neighbours[3 * k + i];
                 if (nb >= 0 && height_cv[nb] > mah) {
                     wet = 1;
-                    break;
+                }
+            }
+        }
+        if (!wet) {
+            // Ring 2: a face-neighbour that itself has a wet face-neighbour.
+            // Recomputed from height (not from the flag array) so there is no
+            // read/write race on active_ids within this single parallel pass.
+            for (int i = 0; i < 3 && !wet; i++) {
+                anuga_int nb = neighbours[3 * k + i];
+                if (nb < 0) continue;
+                if (height_cv[nb] > mah) { wet = 1; break; }   // (already ring1, kept for safety)
+                for (int j = 0; j < 3 && !wet; j++) {
+                    anuga_int nb2 = neighbours[3 * nb + j];
+                    if (nb2 >= 0 && height_cv[nb2] > mah) {
+                        wet = 1;
+                    }
                 }
             }
         }
