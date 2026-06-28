@@ -145,6 +145,17 @@ def partition_mesh(domain, n_procs,
             If True, reorder mesh in place to save memory
         - 'verbose' : bool, default False
             If True, print verbose output during partitioning
+        - 'elevation_weights' : bool, default False
+            Exascale item 5.  When ``True`` and ``partition_scheme='metis'``,
+            METIS vertex weights are derived from the domain's elevation so
+            that wet triangles (bed below ``reference_level``) are treated as
+            more expensive and distributed more evenly across ranks.  Has no
+            effect for Morton / Hilbert / RCM schemes.
+        - 'reference_level' : float, default 0.0
+            Reference water level (metres) used to classify wet/dry cells
+            when ``elevation_weights=True``.
+        - 'weight_scale' : float, default 10.0
+            Cost multiplier per metre of depth below ``reference_level``.
 
     verbose : bool, optional
         If True, print verbose output during partitioning, by default False.
@@ -181,6 +192,9 @@ def partition_mesh(domain, n_procs,
     distribute_quantity_names = DEFAULT_DISTRIBUTE_QUANTITY_NAMES
     in_place = False
     partition_scheme = 'metis'
+    elevation_weights = False
+    reference_level = 0.0
+    weight_scale = 10.0
 
     # Override defaults with user-provided parameters
     if parameters is None:
@@ -194,6 +208,12 @@ def partition_mesh(domain, n_procs,
         in_place = bool(parameters['in_place'])
     if 'verbose' in parameters:
         verbose = bool(parameters['verbose'])
+    if 'elevation_weights' in parameters:
+        elevation_weights = bool(parameters['elevation_weights'])
+    if 'reference_level' in parameters:
+        reference_level = float(parameters['reference_level'])
+    if 'weight_scale' in parameters:
+        weight_scale = float(parameters['weight_scale'])
 
     # Output partitioning parameters if verbose
     if verbose:
@@ -225,7 +245,12 @@ def partition_mesh(domain, n_procs,
     elif partition_scheme == 'rcm':
         epart_order, triangles_per_proc = rcm_partition(domain, n_procs)
     else:
-        epart_order, triangles_per_proc = metis_partition(domain, n_procs)
+        epart_order, triangles_per_proc = metis_partition(
+            domain, n_procs,
+            elevation_weights=elevation_weights,
+            reference_level=reference_level,
+            weight_scale=weight_scale,
+        )
 
     # Build processor IDs and local indices in a fully vectorized way
     proc_ids = num.repeat(num.arange(n_procs, dtype=int), triangles_per_proc)

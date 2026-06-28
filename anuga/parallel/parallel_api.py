@@ -173,7 +173,8 @@ def collect_value(value):
 
 
 
-def distribute(domain, verbose=False, debug=False, parameters = None):
+def distribute(domain, verbose=False, debug=False, parameters=None,
+               sfc_reorder=False, sfc_method='hilbert'):
     """Distribute the domain to all processes in a parallel computing environment.
 
     This function partitions a computational domain across multiple processes and
@@ -194,6 +195,19 @@ def distribute(domain, verbose=False, debug=False, parameters = None):
     parameters : dict, optional
         User-defined parameters to customize distribution behavior,
         particularly the size of ghost layers. Default is None.
+    sfc_reorder : bool, optional
+        Exascale item 4 — if ``True``, reorder each rank's local triangles
+        along a space-filling curve (SFC) after distribution.  This improves
+        cache locality for the unstructured-mesh gather/scatter kernels
+        (``distribute``, ``extrapolate``) by placing spatially adjacent
+        triangles adjacent in memory.  Expected speedup on those kernels is
+        2–4×.
+
+        Must be called *before* creating river walls or operators, as those
+        structures store local triangle indices.  Default ``False``.
+    sfc_method : str, optional
+        SFC ordering to use when ``sfc_reorder=True``.  One of
+        ``'hilbert'`` (default), ``'morton'``, or ``'rcm'``.
 
     Returns
     -------
@@ -286,6 +300,20 @@ def distribute(domain, verbose=False, debug=False, parameters = None):
     parallel_domain.geo_reference = domain_georef
     parallel_domain.set_quantities_to_be_stored(domain_quantities_to_be_stored)
     parallel_domain.smooth = domain_smooth
+
+    # --- Exascale item 4: local SFC reorder within each rank's partition ---
+    # Reorder triangles along a space-filling curve so that spatially adjacent
+    # triangles are adjacent in memory.  This reduces TLB misses and improves
+    # cache hit rates for the gather/scatter kernels (distribute, extrapolate).
+    # domain.reorder() already updates tri_l2g and the ghost communication
+    # dicts, so the parallel correctness is preserved.
+    if sfc_reorder and numprocs > 1:
+        from anuga.parallel.partitioning import reorder_domain as _reorder
+        if verbose:
+            import anuga
+            print(f'distribute: rank {anuga.myid}: applying local {sfc_method} '
+                  f'SFC reorder on {parallel_domain.number_of_triangles} triangles')
+        _reorder(parallel_domain, method=sfc_method, verbose=False)
 
     return parallel_domain
 

@@ -11,9 +11,11 @@ import numpy as np
 # Partitioning using METIS. This minimizes edge cuts and is ideal for parallel computations.
 #==============================================================================================================
 
-def metis_partition(domain, n_procs):
-    """
-    Partition a mesh using METIS partitioning library.
+def metis_partition(domain, n_procs,
+                    elevation_weights=False,
+                    reference_level=0.0,
+                    weight_scale=10.0):
+    """Partition a mesh using METIS partitioning library.
 
     This function is a wrapper for the METIS partitioning routines in pymetis.
     The specific partitioning routine used depends on the installed METIS version:
@@ -27,6 +29,24 @@ def metis_partition(domain, n_procs):
         nodes, triangle connectivity, and neighbor information.
     n_procs : int
         Number of processors to partition the mesh across.
+    elevation_weights : bool, optional
+        Exascale item 5 — if ``True``, weight each triangle by its expected
+        computational cost, which is higher for cells likely to be wet.  The
+        weight is derived from the domain's elevation (bathymetry): cells whose
+        bed elevation is below ``reference_level`` receive a higher integer
+        weight, causing METIS to assign fewer such cells per rank.  This
+        improves static load balance for tsunami/flood simulations where only
+        a fraction of the domain is wet.  Default ``False`` (uniform weights,
+        current behaviour).
+    reference_level : float, optional
+        Water-level reference for the wet/dry classification (default 0.0,
+        i.e. mean sea level).  Triangles with ``elevation < reference_level``
+        are classified as wet.
+    weight_scale : float, optional
+        Multiplicative factor applied to the depth below ``reference_level``
+        to convert to integer vertex weights.  Larger values widen the cost
+        ratio between wet and dry cells; the default 10.0 gives a 10:1 ratio
+        at 1 m depth below ``reference_level``.
 
     Returns
     -------
@@ -73,15 +93,32 @@ def metis_partition(domain, n_procs):
         triangles_per_proc = [n_tri]
         return epart_order, triangles_per_proc
 
+    # --- Exascale item 5: elevation-based vertex weights ---
+    # Compute integer vertex weights for METIS.  The weight represents the
+    # expected computational cost of each triangle.  Wet triangles (bed
+    # elevation below the reference water level) do full flux/momentum work;
+    # dry triangles are skipped by optimise_dry_cells.  METIS assigns fewer
+    # expensive triangles per partition to even out compute load.
+    vwgt = None
+    if elevation_weights and hasattr(domain, 'quantities') and \
+            'elevation' in domain.quantities:
+        elev = domain.quantities['elevation'].centroid_values
+        # depth below reference_level (clamped to zero for dry cells)
+        depth = np.maximum(0.0, reference_level - elev)
+        # integer weights in [1, ...]; dry cells get weight 1
+        weights = 1.0 + weight_scale * depth
+        vwgt = np.maximum(1, np.round(weights).astype(np.int32)).tolist()
+        # When weights are requested, always use part_graph (part_mesh doesn't
+        # expose per-element weights in the current pymetis binding).
+        metis_version = "5_part_graph"
+
     # Use metis to partition the mesh.
     # The partitioning routine used depends on the version of metis installed.
     # If metis 4 is installed, partMeshNodal is used. If metis 5 is installed,
     # part_mesh is used if available, otherwise part_graph
 
     if metis_version == "5_part_mesh":
-
         objval, epart, npart = part_mesh(n_procs, domain.triangles)
-
 
     if metis_version == "5_part_graph":
         # neighbours uses negative entries for boundary edges; pymetis can't
@@ -94,7 +131,11 @@ def metis_partition(domain, n_procs):
         xadj[0] = 0
         np.cumsum(counts, out=xadj[1:])
 
-        cutcount, partvert = part_graph(n_procs, xadj=xadj, adjncy=adjncy)
+        if vwgt is not None:
+            cutcount, partvert = part_graph(
+                n_procs, xadj=xadj, adjncy=adjncy, vweights=vwgt)
+        else:
+            cutcount, partvert = part_graph(n_procs, xadj=xadj, adjncy=adjncy)
 
         epart = partvert
 
@@ -107,15 +148,11 @@ def metis_partition(domain, n_procs):
         epart = epart_new
         del epart_new
 
-
     triangles_per_proc = np.bincount(epart)
 
     msg = "Partition created where at least one submesh has no triangles. "
     msg += "Try using a smaller number of mpi processes."
     assert np.all(triangles_per_proc > 0), msg
-
-    #proc_sum = np.zeros(n_procs+1, int)
-    #proc_sum[1:] = np.cumsum(triangles_per_proc)
 
     epart_order = np.argsort(epart, kind='mergesort')
 
