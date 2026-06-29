@@ -61,33 +61,27 @@ static inline void gpu_compute_qmin_qmax_from_dq1(double dq1, double * restrict 
 
 // Limit gradient to enforce monotonicity
 static inline void gpu_limit_gradient(double * restrict dqv, double qmin, double qmax, double beta_w) {
-    double r = 1000.0;
-
     double dq_x = dqv[0];
     double dq_y = dqv[1];
     double dq_z = dqv[2];
 
-    if (dq_x < -GPU_TINY) {
-        r = fmin(r, qmin / dq_x);
-    } else if (dq_x > GPU_TINY) {
-        r = fmin(r, qmax / dq_x);
-    }
-    if (dq_y < -GPU_TINY) {
-        r = fmin(r, qmin / dq_y);
-    } else if (dq_y > GPU_TINY) {
-        r = fmin(r, qmax / dq_y);
-    }
-    if (dq_z < -GPU_TINY) {
-        r = fmin(r, qmin / dq_z);
-    } else if (dq_z > GPU_TINY) {
-        r = fmin(r, qmax / dq_z);
-    }
+    // Branchless ratio: ternary compiles to cmov/fsel, enabling SIMD in the
+    // outer extrapolation loop.  Logic is identical to the original if/else chain.
+    double r_x = (dq_x > GPU_TINY)  ? (qmax / dq_x) :
+                 (dq_x < -GPU_TINY) ? (qmin / dq_x) : 1000.0;
+    double r_y = (dq_y > GPU_TINY)  ? (qmax / dq_y) :
+                 (dq_y < -GPU_TINY) ? (qmin / dq_y) : 1000.0;
+    double r_z = (dq_z > GPU_TINY)  ? (qmax / dq_z) :
+                 (dq_z < -GPU_TINY) ? (qmin / dq_z) : 1000.0;
 
+    double r = fmin(fmin(r_x, r_y), r_z);
+
+    // Barth-Jespersen phi: clip ratio at 1 to enforce monotonicity.
     double phi = fmin(r * beta_w, 1.0);
 
-    dqv[0] *= phi;
-    dqv[1] *= phi;
-    dqv[2] *= phi;
+    dqv[0] = dq_x * phi;
+    dqv[1] = dq_y * phi;
+    dqv[2] = dq_z * phi;
 }
 
 // Compute edge values with gradient limiting (for typical case with 3 neighbors)

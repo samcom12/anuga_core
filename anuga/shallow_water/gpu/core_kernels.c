@@ -573,7 +573,6 @@ void core_manning_friction_flat_semi_implicit(struct domain *D) {
     anuga_int n = D->number_of_elements;
     double g = D->g;
     double minimum_allowed_height = D->minimum_allowed_height;
-    double seven_thirds = 7.0 / 3.0;
 
     double * restrict stage_cv = D->stage_centroid_values;
     double * restrict bed_cv = D->bed_centroid_values;
@@ -596,7 +595,7 @@ void core_manning_friction_flat_semi_implicit(struct domain *D) {
             double h = stage_cv[k] - bed_cv[k];
             if (h >= minimum_allowed_height) {
                 S = -g * eta * eta * abs_mom;
-                S /= pow(h, seven_thirds);
+                S /= (h * h * cbrt(h));   // h^{7/3} = h^2*h^{1/3}; cbrt faster than pow
             }
         }
         xmom_siu[k] += S * uh;
@@ -654,7 +653,7 @@ void core_manning_friction_sloped_semi_implicit(struct domain *D) {
             double ymom = ymom_cv[k];
 
             double S = -g * eta * eta * sqrt(xmom * xmom + ymom * ymom) * slope;
-            S /= pow(h, 7.0 / 3.0);
+            S /= (h * h * cbrt(h));   // h^{7/3} = h^2*h^{1/3}; cbrt faster than pow
 
             xmom_siu[k] += S;
             ymom_siu[k] += S;
@@ -686,8 +685,7 @@ void core_manning_friction_sloped_semi_implicit_edge_based(struct domain *D) {
     double * restrict xmom_siu   = D->xmom_semi_implicit_update;
     double * restrict ymom_siu   = D->ymom_semi_implicit_update;
 
-    const double one_third   = 1.0 / 3.0;
-    const double seven_thirds = 7.0 / 3.0;
+    const double one_third = 1.0 / 3.0;
 
     OMP_PARALLEL_LOOP
     for (anuga_int k = 0; k < n; k++) {
@@ -726,7 +724,7 @@ void core_manning_friction_sloped_semi_implicit_edge_based(struct domain *D) {
                 double uh = xmom_cv[k];
                 double vh = ymom_cv[k];
                 S = -g * eta * eta * zs * sqrt(uh * uh + vh * vh);
-                S /= pow(h, seven_thirds);
+                S /= (h * h * cbrt(h));   // h^{7/3} = h^2*h^{1/3}; cbrt faster than pow
             }
         }
 
