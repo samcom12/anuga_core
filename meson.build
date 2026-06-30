@@ -183,7 +183,11 @@ if openmp.found()
     # attempt nvptx offloading for all -fopenmp links; disable it here so that
     # sw_domain_openmp_ext (CPU-only) does not trigger the nvptx mkoffload pass.
     # The GPU extension (sw_domain_gpu_ext) sets its own -foffload=nvptx-none.
-    openmp_c_args = ['-O3', '-fopenmp', '-foffload=disable', '-g']
+    # -march=native: emit AVX2/AVX-512 where available; flux loop is ~2-4× wider.
+    # -ffast-math -fno-finite-math-only: allow FMA + SIMD reorder while keeping
+    #   IEEE NaN/Inf semantics (needed for wet/dry guards in the flux kernel).
+    openmp_c_args = ['-O3', '-fopenmp', '-foffload=disable',
+                     '-march=native', '-ffast-math', '-fno-finite-math-only', '-g']
     add_project_link_arguments(['-fopenmp', '-foffload=disable'], language: ['c', 'cpp'])
   endif
   openmp_deps = dependencies + [openmp]

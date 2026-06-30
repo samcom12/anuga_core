@@ -218,10 +218,12 @@ else
     gpu_c_args = ['-O3', '-fiopenmp', '-g']
   elif effective_compiler_id == 'clang'
     # Clang with libomp (LLVM, Homebrew macOS, or AOMP)
-    gpu_c_args = ['-O3', '-fopenmp', '-g']
+    gpu_c_args = ['-O3', '-fopenmp', '-march=native', '-ffast-math', '-fno-finite-math-only', '-g']
   else
-    # GCC and others
-    gpu_c_args = ['-O3', '-fopenmp', '-g']
+    # GCC and others: -march=native enables AVX2/AVX-512 for the flux/extrapolation
+    # kernels; -ffast-math/-fno-finite-math-only adds FMA + SIMD reorder while
+    # preserving NaN/Inf semantics needed for wet/dry guards.
+    gpu_c_args = ['-O3', '-fopenmp', '-march=native', '-ffast-math', '-fno-finite-math-only', '-g']
   endif
   # Define macro so code knows it's CPU-only mode
   gpu_c_args += ['-DCPU_ONLY_MODE']
