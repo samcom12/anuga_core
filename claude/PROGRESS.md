@@ -1,7 +1,7 @@
 # ANUGA Code & Documentation Improvement Progress
 
-Last updated: 2026-05-01 (session 28)
-Branch: `develop` (all feature branches merged)
+Last updated: 2026-06-30 (session 29)
+Branch: `feat/exascale-scaling-samcom12` (open PR candidate onto `develop`)
 
 Full history of completed work: `claude/PROGRESS_ARCHIVE.md`
 Future work recommendations: `claude/FUTURE_WORK.md`
@@ -22,9 +22,10 @@ Future work recommendations: `claude/FUTURE_WORK.md`
 | Quantity memory reduction | 7 | 7 | 0 |
 | Domain memory reduction | 3 | 3 | 0 |
 | Benchmark suite | 2 | 2 | 0 |
+| Exascale parallel scaling (ES1–ES6) | 6 | 6 | 0 |
 | Bug fixes | 7 | 7 | 0 |
 | Kinematic viscosity parallelisation | 4 | 4 | 0 |
-| **Total** | **205** | **197** | **8** |
+| **Total** | **211** | **203** | **8** |
 
 ---
 

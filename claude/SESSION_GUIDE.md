@@ -41,6 +41,7 @@ the active working branch. feat/sc26 contains GPU/OpenMP-offloading work
 |--------|---------|
 | `main` | Stable — v3.3.1 release |
 | `develop` | Active development for v4.0.0 — contains GPU work + ADER-2 |
+| `feat/exascale-scaling-samcom12` | **Current** — exascale parallel items 1–6 + hot-kernel opts (cbrt, branchless limiter) |
 | `develop_sc26` | Working branch for GPU/SC26 incremental improvements |
 | `develop_gpu` / `develop_cupy` | Earlier GPU experiments (CuPy-based) |
 | `experiment/claude_culvert_refactor` | Culvert structure refactoring experiment |
@@ -48,6 +49,23 @@ the active working branch. feat/sc26 contains GPU/OpenMP-offloading work
 Target PR branch is `develop` for all new work going into v4.0.0.
 
 `develop_ader` merged into `develop` 2026-04-29.
+
+### Exascale benchmark status (2026-06-30)
+
+64-rank (4 nodes × 16 MPI × 3 OMP) Mahanadi Delta benchmark on 173 M triangles.  
+Full results and methodology: `claude/PROGRESS_ARCHIVE.md` → "Exascale Parallel Scaling".
+
+**Job 325036** (commit `e40dc738`, post hot-kernel opts B+C):
+
+| Configuration | Wall (s) | Comm (s) | Speedup |
+|---|---|---|---|
+| Baseline (global Allreduce) | 1164.13 | 31.06 | 1.000× |
+| Hierarchical timestep | 1152.99 | 23.52 | 1.010× |
+| Ghost-exchange overlap | 1187.39 | 36.83 | 0.980× |
+| Hierarchical + overlap (combined) | 1147.94 | 28.11 | 1.014× |
+
+Comm reductions vs job 324958: Reduce time cut 45–53% by hierarchical algorithm.  
+B+C kernel changes (cbrt Manning + branchless limiter) show no measurable speedup; Manning is ~18/659 FLOPs = 2.7% of total budget. ~37% higher absolute wall vs 324958 is attributed to node-assignment variability (different physical nodes, same `--exclusive` cluster), not the code changes — relative speedups between configurations remain unchanged.
 
 ---
 

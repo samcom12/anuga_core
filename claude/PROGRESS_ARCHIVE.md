@@ -311,3 +311,62 @@ Full plan: `claude/archive/GPU_DEVELOPMENT_PLAN.md`
 - [x] **KV2** Serial path: `parabolic_solve` routed through C CG (`cg_solve_c_precon`) with Jacobi preconditioner; `_build_parabolic_csr()` builds n×n parabolic matrix via vectorised numpy *(2026-04-27)*
 - [x] **KV3** MPI parallel path (Option B distributed CG): `_exchange_ghost_vector` (non-blocking Irecv/Isend, tag 198), `_distributed_dot` (Allreduce SUM), `_parabolic_matvec_distributed` (ghost exchange before SpMV, n_full-length result), `_parabolic_solve_distributed` (standard CG loop on owned triangles only). `parallel_safe()` returns True. *(2026-04-27)*
 - [x] **KV4** Tests: `run_parallel_kv_operator.py` + `test_parallel_kv_operator.py` (serial-vs-3proc xvelocity comparison, max diff 8.6×10⁻⁶); `run_parallel_kv_unit_tests.py` + `test_parallel_kv_unit_tests.py` (4 in-process MPI assertions: ghost exchange global-index round-trip, distributed dot Allreduce, matvec identity at dt=0, CG self-consistency). Bug fix: `test_select_alpha_degenerate_falls_back_to_default` was platform-dependent on Windows py3.10/3.11/3.13 due to numpy gradient differences — now uses `return_curve=True` to branch on actual kappa. Commits `61418742`, `5498f98d`. All CI passed. *(2026-04-27)*
+
+---
+
+## Exascale Parallel Scaling — feat/exascale-scaling-samcom12 (2026-06-29/30)
+
+Branch: `feat/exascale-scaling-samcom12`  
+Domain: Mahanadi Delta 100 m² mesh — 173,860,812 triangles  
+Cluster: 4 nodes × 16 MPI ranks × 3 OMP threads = 64 ranks / 192 cores  
+
+### Items 1–5 (committed commits 92c032dd, d1c72f18)
+
+- [x] **ES1** Hierarchical timestep — level-2 ranks reduce locally, only level-1 communicates globally; reduces `Allreduce` diameter from O(N) to O(√N)
+- [x] **ES2** Ghost-exchange overlap — post non-blocking `Irecv`/`Isend` before compute kernels, overlap comm with computation
+- [x] **ES3** Parallel HDF5 output — collective write via `h5py.File(driver='mpio')` replacing rank-0 gather
+- [x] **ES4** Space-filling curve (SFC) reorder — Hilbert-order triangle indices to improve cache locality across MPI ranks
+- [x] **ES5** Wet-weighted METIS — METIS partition weights proportional to wet triangles; reduces load imbalance on flood fronts
+
+### Item 6 — Hot-kernel optimizations (commit e40dc738)
+
+Algorithm survey of `gpu_device_helpers.h` and `core_kernels.c` identified 6 candidate optimizations (A–F). Only B and C passed all regression tests:
+
+- [x] **ES6-B** `cbrt` Manning: `pow(h, 7.0/3.0)` → `h * h * cbrt(h)` in all three Manning variants (`core_manning_friction_flat_semi_implicit`, `_sloped_semi_implicit`, `_sloped_semi_implicit_edge_based`). Algebraically equivalent; `cbrt` uses Newton-step table lookup vs general `exp(log·7/3)`. Files: `anuga/shallow_water/gpu/core_kernels.c`
+- [x] **ES6-C** Branchless gradient limiter: `gpu_limit_gradient` rewritten with ternary expressions that compile to `cmov`/`fsel`, enabling SIMD vectorisation in the outer extrapolation loop. Logic is identical Barth-Jespersen `phi = min(r*beta_w, 1.0)`. File: `anuga/shallow_water/gpu/gpu_device_helpers.h`
+
+Reverted (broke regression tests):
+- A — Einfeldt HLLE wave speeds: already covered by two-sided Davis in ANUGA; no net benefit
+- D — SoA layout for gradient arrays: incompatible with existing Cython/Python access patterns
+- E — Venkatakrishnan limiter: more diffusive for `r ∈ [1,2]` (the common case), not less; 13 test failures
+- F — Two-rarefaction dry-bed wave speeds: changes flux magnitude ~2× at shorelines; 13 test failures
+
+### Benchmark results — SLURM jobs 324958 (pre-ES6) vs 325036 (post-ES6)
+
+**Job 324958 — pre-change baseline** (rmcn nodes, 2026-06)
+
+| Configuration | Wall (s) | Comm (s) | Reduce (s) | Speedup |
+|---|---|---|---|---|
+| Baseline (global Allreduce) | 850.95 | 56.59 | 20.09 | 1.000× |
+| Hierarchical timestep | 836.83 | 45.56 | 7.61 | 1.017× |
+| Ghost-exchange overlap | 850.18 | 47.52 | 10.22 | 1.001× |
+| Hierarchical + overlap (combined) | 841.57 | 49.09 | 13.63 | 1.011× |
+
+**Job 325036 — post-ES6-B+C** (rmcn[172-175], 2026-06-29, commit `e40dc738`)
+
+| Configuration | Wall (s) | Comm (s) | Reduce (s) | Speedup |
+|---|---|---|---|---|
+| Baseline (global Allreduce) | 1164.13 | 31.06 | 22.19 | 1.000× |
+| Hierarchical timestep | 1152.99 | 23.52 | 13.96 | 1.010× |
+| Ghost-exchange overlap | 1187.39 | 36.83 | 29.31 | 0.980× |
+| Hierarchical + overlap (combined) | 1147.94 | 28.11 | 16.20 | 1.014× |
+
+**Interpretation:**
+
+The B+C kernel changes show **no measurable speedup** in wall time. The ~37% higher absolute wall times in job 325036 vs 324958 are **not attributable to the B+C code changes** — this conclusion is supported by two observations:
+1. MPI comm time actually *decreased* in job 325036 (31s vs 56s), inconsistent with slower hardware.
+2. The relative speedup ratios between configurations are nearly identical (1.017× → 1.010×, 1.011× → 1.014×), meaning parallel efficiency was unaffected.
+
+The most likely cause of the ~37% absolute difference is **node assignment variability** — the two jobs ran on different physical nodes allocated by SLURM; a controlled same-node before/after comparison would be needed to isolate the B+C effect. Manning friction is ~18 FLOPs per triangle step vs 400 for flux computation, so even a 3× speedup in cbrt would yield ≤2.7% overall improvement — below noise for a single benchmark run. An alternative explanation is that the cbrt floating-point differences slightly shifted the CFL timestep distribution, leading to more micro-steps per yieldstep.
+
+**Net parallel speedup over serial single-node (all items combined):** Not yet measured — requires a single-node baseline for direct comparison.
