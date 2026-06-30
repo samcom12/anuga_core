@@ -55,17 +55,21 @@ Target PR branch is `develop` for all new work going into v4.0.0.
 64-rank (4 nodes × 16 MPI × 3 OMP) Mahanadi Delta benchmark on 173 M triangles.  
 Full results and methodology: `claude/PROGRESS_ARCHIVE.md` → "Exascale Parallel Scaling".
 
-**Job 325036** (commit `e40dc738`, post hot-kernel opts B+C):
+**Job 325531** (commit `d149c923`, -march=native + set_store(False) + ADER-2, 2026-06-30):
 
 | Configuration | Wall (s) | Comm (s) | Speedup |
 |---|---|---|---|
-| Baseline (global Allreduce) | 1164.13 | 31.06 | 1.000× |
-| Hierarchical timestep | 1152.99 | 23.52 | 1.010× |
-| Ghost-exchange overlap | 1187.39 | 36.83 | 0.980× |
-| Hierarchical + overlap (combined) | 1147.94 | 28.11 | 1.014× |
+| Baseline (global Allreduce) | 1137.26 | 16.61 | 1.000× |
+| Hierarchical timestep | 1146.66 | 22.71 | 0.992× |
+| Ghost-exchange overlap | 1131.15 | 3.78 | 1.005× |
+| Hierarchical + overlap (combined) | 1149.93 | 29.40 | 0.989× |
+| **ADER-2 + hierarchical + overlap** | **596.01** | **1.01** | **1.908×** |
 
-Comm reductions vs job 324958: Reduce time cut 45–53% by hierarchical algorithm.  
-B+C kernel changes (cbrt Manning + branchless limiter) show no measurable speedup; Manning is ~18/659 FLOPs = 2.7% of total budget. ~37% higher absolute wall vs 324958 is attributed to node-assignment variability (different physical nodes, same `--exclusive` cluster), not the code changes — relative speedups between configurations remain unchanged.
+**Key finding: ADER-2 (`DE_ader2`) gives 1.91× speedup** — halved flux FLOPs translate directly to ~2× throughput at compute-bound scale. Comm drops to 1s (fewer micro-steps → fewer ghost exchanges). Hierarchical/overlap remain flat at 64 ranks (comm is only 1.5% of wall time). For production runs on this mesh, `DE_ader2` should be the default algorithm.
+
+**Earlier jobs for reference:**
+- Job 324958 (pre-ES6): Baseline=850.95s, Combined=841.57s — different nodes, much faster; node variability is the main source of absolute-time differences between jobs
+- Job 325036 (ES6-B+C): Baseline=1164.13s, Combined=1147.94s — cbrt/branchless changes show no measurable speedup (Manning ~2.7% of total FLOPs)
 
 ---
 
